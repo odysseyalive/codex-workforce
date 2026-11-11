@@ -135,8 +135,13 @@ sys.exit(0 if a < b else 1)' "$1" "$2" 2>/dev/null
 if [ "$ACTION" = uninstall ]; then
   # Only the skills this installer put there, as recorded at install time.
   if [ -f "$INSTALL_DIR/installed-skills.txt" ]; then
+    # A name must be a single plain cwf-* component: a tampered list could otherwise
+    # name ../ paths and turn this into a recursive delete outside the skills folder.
     while IFS= read -r name; do
-      case "$name" in cwf-*) rm -rf "${SKILLS_DIR:?}/$name" ;; esac
+      if printf '%s' "$name" | grep -Eq '^cwf-[A-Za-z0-9._-]+$' && [ "${name#*..}" = "$name" ] \
+         && [ ! -L "$SKILLS_DIR/$name" ]; then
+        rm -rf "${SKILLS_DIR:?}/$name"
+      fi
     done < "$INSTALL_DIR/installed-skills.txt"
   fi
   rm -rf "$INSTALL_DIR"

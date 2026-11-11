@@ -140,8 +140,18 @@ function Get-Remote([string]$Rel, [string]$Dest) {
 if ($DoUninstall) {
     $list = Join-Path $InstallDir "installed-skills.txt"
     if (Test-Path $list) {
+        # A name must be a single plain cwf-* component that resolves to a direct child of
+        # the skills folder: a tampered list could otherwise name ..\ paths and turn this
+        # into a recursive delete outside it.
+        $skillsFull = [IO.Path]::GetFullPath($SkillsDir)
         foreach ($name in Get-Content $list) {
-            if ($name -like "cwf-*") { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $SkillsDir $name) }
+            if ($name -notmatch '^cwf-[A-Za-z0-9._-]+$' -or $name.Contains("..")) { continue }
+            $target = [IO.Path]::GetFullPath((Join-Path $SkillsDir $name))
+            if ([IO.Path]::GetDirectoryName($target) -ne $skillsFull) { continue }
+            $item = Get-Item -Force -ErrorAction SilentlyContinue $target
+            if ($item -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                Remove-Item -Recurse -Force $target
+            }
         }
     }
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir

@@ -120,6 +120,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("existence", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
 
+    def test_tampered_skill_list_cannot_delete_outside_skills(self):
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        victim = os.path.join(self.home, "victim")
+        os.makedirs(os.path.join(victim, "keep"))
+        os.makedirs(os.path.join(self.home, ".agents/skills/cwf-x"))   # makes ../ resolve
+        with open(os.path.join(self.codex, "codex-workforce", "installed-skills.txt"), "a") as fh:
+            fh.write("cwf-x/../../../victim\ncwf-../../victim\n")
+        r = self.run_install("--user", "--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(os.path.join(victim, "keep")), "uninstall escaped the skills folder")
+
     def test_downgrade_is_refused_without_force(self):
         self.assertEqual(self.run_install("--user").returncode, 0)
         with open(os.path.join(self.codex, "codex-workforce", "VERSION"), "w") as fh:

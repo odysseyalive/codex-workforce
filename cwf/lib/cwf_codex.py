@@ -57,17 +57,43 @@ def project_root(cwd):
     return cwd
 
 
+class UnsafeStateDir(RuntimeError):
+    """A component of the state path is a symlink; nothing is written through it."""
+
+
+def _refuse_links(base, parts):
+    """Raise when `base` or any existing component below it is a symlink. The state holds
+    the user's prompts and transcripts, so a planted link must never redirect them (the rule
+    upstream's issues_dir applies to its ledger)."""
+    p = base
+    for part in ("",) + tuple(parts):
+        p = os.path.join(p, part) if part else p
+        if os.path.islink(p):
+            raise UnsafeStateDir(f"refusing to write through symlink {p}")
+
+
 def state_dir(root, *parts, create=True):
     """`<root>/.codex-workforce/<parts>`. The directory ignores itself in git on creation,
-    because it holds the user's prompts (the same rule wf-task-tag applies to `issues/`)."""
+    because it holds the user's prompts (the same rule wf-task-tag applies to `issues/`).
+    Raises UnsafeStateDir when any component is a symlink."""
+    for part in parts:
+        if not part or part in (".", "..") or os.sep in part or (os.altsep and os.altsep in part):
+            raise UnsafeStateDir(f"bad state path component {part!r}")
     base = os.path.join(root, STATE_DIRNAME)
     d = os.path.join(base, *parts)
+    _refuse_links(base, parts)
     if create:
         os.makedirs(d, exist_ok=True)
+        _refuse_links(base, parts)   # nothing raced a link in during creation
         ignore = os.path.join(base, ".gitignore")
-        if not os.path.exists(ignore):
-            with open(ignore, "w", encoding="utf-8") as fh:
-                fh.write("*\n")
+        if not os.path.lexists(ignore):
+            try:
+                fd = os.open(ignore, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write("*\n")
+            except FileExistsError:
+                pass
     return d
 
 

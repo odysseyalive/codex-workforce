@@ -10,3 +10,6 @@ The version lives in `VERSION`. Bump it in the same change that alters anything 
   and SubagentStop.
 - `cwf-blueprint` skill generated from claude-workforce's blueprint.
 - Installers for Linux/macOS (`install`) and Windows (`install.ps1`), personal or project scope.
+- Hardening before release: the state directory refuses symlinks and `..` components, so
+  prompts and transcripts can't be redirected outside `.codex-workforce/`; uninstall only
+  removes plain `cwf-*` skill folders directly inside the skills directory.

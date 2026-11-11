@@ -226,6 +226,34 @@ class SenseTests(unittest.TestCase):
             self.assertNotIn(claude_only, prompt)
         self.assertIn('{"ok": true}', prompt)
 
+    # ── state directory safety ──────────────────────────────────────────────
+
+    def test_symlinked_state_dir_is_refused_and_nothing_leaks(self):
+        outside = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(self.proj, ".codex-workforce"))
+        with self.assertRaises(cwf_codex.UnsafeStateDir):
+            cwf_codex.state_dir(self.proj, "scratch", "s1")
+        q = "is there any file named foo.txt anywhere in this repo?"
+        out = self.hook("prompt", self.payload(self.write_rollout(rollout_rows(q, [], "")),
+                                               hook_event_name="UserPromptSubmit", prompt=q))
+        self.assertIn("symlink", out.get("systemMessage", ""))
+        self.assertEqual(os.listdir(outside), [], "a prompt was written through the link")
+
+    def test_symlinked_inner_dir_is_refused(self):
+        outside = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(outside)
+        os.makedirs(os.path.join(self.proj, ".codex-workforce"))
+        os.symlink(outside, os.path.join(self.proj, ".codex-workforce", "scratch"))
+        with self.assertRaises(cwf_codex.UnsafeStateDir):
+            cwf_codex.state_dir(self.proj, "scratch", "s1")
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_state_dir_rejects_path_components(self):
+        for bad in ("..", "a/b", ""):
+            with self.assertRaises(cwf_codex.UnsafeStateDir):
+                cwf_codex.state_dir(self.proj, bad)
+
     # ── .gitignore ──────────────────────────────────────────────────────────
 
     INFRA = [".claude/workforce/x.json", "CLAUDE.md", ".crush/crush.db", ".opencode/x",
