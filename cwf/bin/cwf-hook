@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Codex hook entry point for the codex-workforce sensory layer.
+
+    cwf-hook prompt     UserPromptSubmit and SubagentStart -> wf-task-tag
+    cwf-hook stop       Stop and SubagentStop -> wf-turn-ledger, wf-widen, then the juror
+
+Codex launches matching hooks for one event concurrently, so the Stop steps that Claude
+Code runs in settings order are run here in that same order, in one hook.
+
+Never fails a turn: any error inside the adapter prints a systemMessage and exits 0, so a
+broken sense is visible and never wedges a session.
+"""
+import json
+import os
+import sys
+import traceback
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import cwf_codex  # noqa: E402
+
+
+def emit(obj):
+    if obj:
+        print(json.dumps(obj))
+
+
+def prompt_event(raw):
+    payload, env = cwf_codex.normalize_payload(raw)
+    # A Stop block replayed by Codex as a new prompt starts with the feedback prefix;
+    # wf-task-tag's INJECTED rule already ignores it, so it is passed through unchanged.
+    # 25s inside the hook's 30s timeout, so a slow step is reported rather than killed.
+    _, out, text, problem = cwf_codex.run_step("wf-task-tag", payload, env, timeout=25)
+    if not isinstance(out, dict):
+        out = {} if not text else None
+    if problem:
+        if out is None:
+            out = {}
+        out["systemMessage"] = _join(out.get("systemMessage"), f"cwf: {problem}")
+    if out is not None:
+        emit(out)
+    elif text:
+        # UserPromptSubmit and SubagentStart accept plain text as extra developer context.
+        print(text)
+    return 0
+
+
+def _join(a, b):
+    return (a + "\n" if a else "") + (b or "")
+
+
+def stop_event(raw):
+    import cwf_juror
+    payload, env = cwf_codex.normalize_payload(raw)
+    root = env["CWF_PROJECT_ROOT"]
+    system = ""
+    if payload.get("cwf_reply_unmatched"):
+        # Upstream judges nothing it cannot confirm, so say why this turn went unjudged.
+        system = "cwf: the reply never appeared in the transcript; this turn was not judged"
+
+    # Budget inside the hook's 300s: ledger 30 + widen 60 + juror (CWF_JUROR_TIMEOUT, 150).
+    _, ledger, _, problem = cwf_codex.run_step("wf-turn-ledger", payload, env, timeout=30)
+    if problem:
+        system = _join(system, f"cwf: {problem}")
+    if isinstance(ledger, dict):
+        system = _join(system, ledger.get("systemMessage"))
+
+    _, widen, _, problem = cwf_codex.run_step("wf-widen", payload, env, timeout=60)
+    if problem:
+        system = _join(system, f"cwf: {problem}")
+    widen = widen if isinstance(widen, dict) else {}
+    system = _join(system, widen.get("systemMessage"))
+    if widen.get("decision") == "block":
+        return emit_block(widen.get("reason") or "", system)
+
+    if payload.get("stop_hook_active") or os.environ.get("CWF_JUROR", "on") == "off":
+        return emit_ok(system)
+    # The scratch directory is already per session, and wf-widen raises its flag there
+    # under wf-task-tag's own session_component name; find it rather than restate that rule.
+    # Only the main session raises one (wf-widen `raise_flag` is reached only when not a
+    # subagent), and wf-task-tag clears it at the head of every turn.
+    import glob
+    flags = sorted(glob.glob(os.path.join(payload["scratchpad_dir"], "wf-widen-flag.*.json")),
+                   key=os.path.getmtime)
+    if not flags or raw.get("hook_event_name") == "SubagentStop":
+        return emit_ok(system)
+    flag = flags[-1]
+    verdict, diag = cwf_juror.judge(payload, flag, root)
+    if diag:
+        system = _join(system, f"cwf juror: {diag}")
+    if isinstance(verdict, dict) and verdict.get("ok") is False:
+        return emit_block("Agent hook condition was not met: " + str(verdict.get("reason") or ""),
+                          system)
+    if isinstance(verdict, dict) and verdict.get("notes"):
+        system = _join(system, "juror notes: " + "; ".join(str(n) for n in verdict["notes"]))
+    return emit_ok(system)
+
+
+def emit_ok(system):
+    # Stop and SubagentStop require JSON on stdout when exiting 0.
+    emit({"systemMessage": system} if system else {"continue": True})
+    return 0
+
+
+def emit_block(reason, system):
+    # cw-dev (b): Codex replays a block's reason as a NEW USER PROMPT. The prefix is what
+    # wf-task-tag's INJECTED rule recognises, so the continuation is never tagged as an ask.
+    out = {"decision": "block", "reason": cwf_codex.FEEDBACK_PREFIX + reason}
+    if system:
+        out["systemMessage"] = system
+    emit(out)
+    return 0
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("prompt", "stop"):
+        print("usage: cwf-hook {prompt|stop}", file=sys.stderr)
+        return 2
+    try:
+        raw = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raw = {}
+    try:
+        return prompt_event(raw) if sys.argv[1] == "prompt" else stop_event(raw)
+    except Exception as exc:  # never wedge a session over the adapter
+        msg = f"cwf-hook {sys.argv[1]} failed: {exc.__class__.__name__}: {exc}"
+        log = os.environ.get("CWF_DEBUG") and traceback.format_exc()
+        emit({"systemMessage": msg + ("\n" + log if log else "")} if sys.argv[1] == "stop"
+             else {"systemMessage": msg})
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

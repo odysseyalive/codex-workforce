@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Copy the claude-workforce files codex-workforce builds on, unchanged, from one
+# pinned commit into upstream/claude-workforce/, and record where they came from.
+#
+# Usage: scripts/sync-upstream [COMMIT]   (default: HEAD of the local checkout)
+# Env:   CW_REPO  path to the claude-workforce checkout (default ~/lab/claude-workforce)
+#
+# The copies are reference source: nothing here is wired into Claude Code or Codex.
+set -euo pipefail
+
+CW_REPO="${CW_REPO:-$HOME/lab/claude-workforce}"
+COMMIT="${1:-HEAD}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="$ROOT/upstream/claude-workforce"
+
+# The sensory layer (task tagging, turn ledger, widen + juror wiring), the senses
+# reference, and the blueprint skill. wf-widen imports wf-turn-budget, so it comes too.
+PATHS=(
+  workforce/bin/wf-task-tag
+  workforce/bin/wf-turn-ledger
+  workforce/bin/wf-widen
+  workforce/bin/wf-turn-budget
+  workforce/bin/wf-settings-apply
+  workforce/references/senses.md
+  workforce/skills/blueprint
+)
+
+sha="$(git -C "$CW_REPO" rev-parse "$COMMIT^{commit}")"
+pushed="no"
+if git -C "$CW_REPO" merge-base --is-ancestor "$sha" origin/main 2>/dev/null; then pushed="yes"; fi
+
+prev=""
+[ -f "$DEST/UPSTREAM.md" ] && prev="$(sed -n 's/^- Commit: `\([0-9a-f]*\)`.*/\1/p' "$DEST/UPSTREAM.md")"
+
+rm -rf "$DEST/workforce"
+mkdir -p "$DEST"
+git -C "$CW_REPO" archive "$sha" "${PATHS[@]}" | tar -x -C "$DEST"
+
+{
+  echo "# Upstream: claude-workforce"
+  echo
+  echo "Unmodified copies of claude-workforce files. Do not edit them here; adapt them"
+  echo "elsewhere in this repo and re-run \`scripts/sync-upstream\` to update."
+  echo
+  echo "- Source: \`$(git -C "$CW_REPO" remote get-url origin 2>/dev/null || echo "$CW_REPO")\`"
+  echo "- Commit: \`$sha\` ($(git -C "$CW_REPO" log -1 --format='%ad, %s' --date=short "$sha"))"
+  echo "- Pushed to origin/main when copied: $pushed"
+  echo "- Copied: $(date -u +%Y-%m-%dT%H:%MZ)"
+  echo
+  echo "## Files (sha256)"
+  echo
+  (cd "$DEST" && find workforce -type f | sort | while read -r f; do
+    printf -- '- `%s` %s\n' "$f" "$(sha256sum "$f" | cut -c1-16)"
+  done)
+} > "$DEST/UPSTREAM.md"
+
+echo "copied ${#PATHS[@]} paths at ${sha:0:7} (pushed: $pushed) into ${DEST#$ROOT/}"
+if [ -n "$prev" ] && [ "$prev" != "$sha" ]; then
+  echo "changes since previous pin ${prev:0:7}:"
+  git -C "$CW_REPO" diff --stat "$prev" "$sha" -- "${PATHS[@]}" | tail -n +1
+fi

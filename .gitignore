@@ -1,0 +1,42 @@
+# codex-workforce .gitignore
+#
+# Only the package is committed: AGENTS.md, .agents/skills/, .codex/hooks.json, cwf/,
+# scripts/, tests/ and upstream/. Everything below is either the package's own runtime
+# state or the tooling used to build it, and never ships. tests/test_senses.py checks
+# both halves (test_gitignore_*), so keep this file and that test in step.
+
+# ── runtime state the package writes in any project it runs in ──────────────────
+.codex-workforce/
+
+# ── build infrastructure: the agents and tools used to develop this package ──────
+# Claude Code and claude-workforce (state, settings, memory files)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+# Crush (session database and logs)
+.crush/
+CRUSH.md
+CRUSH.local.md
+# opencode
+.opencode/
+# playwright-mcp browser snapshots and screenshots
+.playwright-mcp/
+# agent-say / tmux-revive / herdr scratch
+.agent-say/
+.herdr/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+
+# ── secrets and local environment ───────────────────────────────────────────
+.env
+.env.*
+*.local.json
+
+# ── editors and OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

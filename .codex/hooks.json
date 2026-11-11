@@ -1,0 +1,52 @@
+{
+  "description": "codex-workforce sensory layer: ask tagging, turn ledger, widen and juror (cwf/bin/cwf-hook).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/cwf/bin/cwf-hook\" prompt",
+            "timeout": 30,
+            "additionalContextLimit": 6000
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/cwf/bin/cwf-hook\" prompt",
+            "timeout": 30,
+            "additionalContextLimit": 6000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/cwf/bin/cwf-hook\" stop",
+            "timeout": 300,
+            "statusMessage": "Checking the turn's claims against its evidence"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/cwf/bin/cwf-hook\" stop",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

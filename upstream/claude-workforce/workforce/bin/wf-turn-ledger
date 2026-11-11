@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""wf-turn-ledger — report what this turn actually looked at, before the reply lands.
+
+WHY THIS EXISTS, and it is not the guard that died. MEASURED 2026-09-09 over one
+working session: ten times the operator was in a tunnel — a conclusion settled early
+and defended. NINE of the ten escapes came from OUTSIDE (six from the user, three
+from a spawned panel). The tenth came from re-reading a tool's raw output. Zero came
+from noticing.
+
+That measurement kills the whole family of self-checks. Every one of them needs the
+operator to DECIDE to run it, and that decision is made from inside the tunnel by the
+faculty that is impaired. The literature agrees: metacognition in frontier models is
+real but "limited in resolution" and "context-dependent" (arXiv 2509.21545, ICLR
+2026), and reasoning is latent-state trajectory formation rather than surface
+chain-of-thought (arXiv 2604.15726) — so reading one's own reasoning to check for
+narrowing inspects the wrong object.
+
+WHAT THIS DOES INSTEAD. It never reads the reply. It never judges anything. It counts
+the tool calls the turn actually made and prints them, so the one reader who
+demonstrably escapes tunnels — the human — can see in a glance whether the turn was
+grounded. A turn that asserts a lot and read nothing is visible without anyone having
+to detect anything.
+
+WHY A COUNT AND NOT A CHECK. `wf-speak-guard` died at a MEASURED 7.0% false-positive
+rate over 2,149 real replies (changes/1.30.1.md), and its removal is asserted so it
+stays removed: "re-adding a substring test for this would repeat a measured failure."
+A count has no false-positive rate. It cannot fire on a good reply, because it does
+not fire — it reports. The judgment stays with the reader, which is where the
+measurement says the working judgment already is.
+
+WHAT IT IS NOT. It is not a claim the turn was wrong, and it must never be described
+as one. A turn with zero reads is often correct — answering from context already in
+hand is directive two's explicit instruction. What the count buys is that the reader
+does not have to GUESS which turns those were.
+
+EXIT CODES: 0 always. A hook that wedges a session over its own bookkeeping is worse
+than the defect it watches.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+
+# Tools that ACQUIRE information about the world. There is NO write column and no
+# command classification, and that is the fix rather than an omission.
+#
+# MEASURED 2026-09-09, the day this shipped: the first version split Bash into
+# read/write by substring, and `grep -rn foo . 2>/dev/null` scored as a WRITE because
+# `>` was on the write list. So did `python3 bin/check 2>&1 | grep passed`. Those are
+# the two most common recon commands in the session that built this file — it
+# under-counted exactly the reads it exists to surface, silently.
+#
+# That is the substring-classification failure that retired `wf-speak-guard` at a
+# measured 7.0% (changes/1.30.1.md), one layer down: not judging prose, but judging
+# commands, with no measured error rate. A COUNT has no false-positive rate; a
+# CLASSIFIER does, and this file's own header claimed the former while doing the
+# latter. Counting reads needs no classifier, so there is none.
+READERS = {"Read", "Grep", "Glob", "WebSearch", "WebFetch", "NotebookRead"}
+
+# Tools that reach BEYOND this repository's own files — the web, a spawned reader, a
+# skill, an MCP server. Counted apart from reads for the reason in `turn_counts`.
+OUTSIDE = {"WebSearch", "WebFetch", "Agent", "Task", "Skill"}
+
+# A Bash command that CHANGES the tree, as against one that reads it. Narrow on
+# purpose: an in-place edit, a redirect or heredoc into a file, a move or remove, a
+# git write. `cat`, `grep` and `sed -n` are reads and must stay reads.
+WRITE_CMD = re.compile(
+    r"\bgit\s+(?:commit|apply|checkout|reset|rm|mv|add)\b"
+    r"|\b(?:sed|perl)\b[^|;\n]*\s-i\b"
+    r"|\b(?:tee|mv|rm|cp|mkdir|touch|chmod)\b"
+    r"|>\s*[\w./-]+"
+    r"|<<\s*.?[A-Z]{2,}")
+
+# READING THE RECORD IS HEARING, and this set is why the guard blocked a turn that had
+# done exactly what it asked. `wf-task-tag`'s own SENSE_HOW tells a reader that hearing
+# means *"read the record that decided it (`git log`, the project's own changelog or
+# decision notes), or ask a source outside this turn's own reasoning"* — and nothing counted
+# either. (Until 2026-11-10 it named `workforce/changes/`, this repository's record.) A turn that
+# read `changes/1.30.1.md` and `1.30.2.md` before removing a mechanism scored `hearing 0`
+# and was blocked for not opening the channel it had opened.
+#
+# The two halves disagreed because they were written apart: the INSTRUCTION names the
+# change record and the git log; the DETECTOR named five tool types and no commands. Same
+# producer/consumer split as `SET_CMD`'s spelling list and `distinct`'s first token, and
+# the same cost — a guard that refuses the work it demands teaches its reader it is noise.
+#
+# Testimony is a command as much as a tool: `git log` and `git show` are the record
+# speaking, and `changes/` is this distribution's own. A point read of a source file is
+# NOT hearing and must not become it — that is sight, and conflating them would let any
+# turn satisfy hearing by reading anything.
+OUTSIDE_CMD = re.compile(
+    r"\bgit\s+(?:log|show|blame|diff)\b"
+    r"|\bchanges/[0-9]"
+    r"|\bwf-changes\b")
+
+# ── this distribution's OWN coined vocabulary ────────────────────────────────
+# Words that mean nothing to a reader who has not read these files. Not "hard
+# words" and not a style opinion: each one is a term this project invented, and a
+# reply that uses one bare has asked the user to decode it first.
+#
+# MEASURED 2026-09-09 over 4,447 real Opus 5 replies: 7.0% carried one of these.
+# That is the largest of the four defect classes measured that day — more than
+# double the unsourced-causal-claim rate (2.9%) and twenty times the caving-opener
+# rate (0.3%) — and it is the one the user has filed complaints about repeatedly.
+#
+# WHY THIS IS NOT THE GUARD THAT DIED. `wf-speak-guard` fired on 7.0% of GOOD
+# replies because it matched ordinary English — "wrong", "failed", "gap"
+# (changes/1.30.1.md). These words have no ordinary meaning to match; a fire means
+# the term is genuinely there. And this REPORTS rather than blocks, naming the exact
+# term, so the remedy is unambiguous: say it plainly.
+JARGON = re.compile(
+    r"\brung \d+[a-z]?\b|\bINV-[A-Z]+\b|\bvacuous\b|\bdormant\b|\bemitter\b"
+    r"|\bthe pool\b|\bfan-out\b|\bORG-(?:CHAIN|RECORD)\b|\bremainder test\b"
+    r"|\bT7[a-z]?\b")
+
+# CODE SPANS ARE MASKED BEFORE MATCHING, and that is a measured correction rather
+# than caution. Unmasked, the rate was 7.0% and the false positives were all one
+# shape: `dormant` inside a probe FILENAME, `fan-out` inside a table cell of
+# identifiers. Masking dropped it to 5.2% and removed that whole class. A backticked
+# term is naming an artifact; a bare one is asking the reader to decode it.
+# ── the ungrounded-absence trigger ───────────────────────────────────────────
+# The ONE trigger that survived measurement, and three that did not.
+#
+# MEASURED over 1,495 substantive Opus 5 turns from this machine's transcripts:
+#     a reasoning-depth counter          fires NEVER — max observed depth 5
+#                                        against a Deterministic Horizon of 19-31
+#                                        (arXiv 2606.00376). Wrong failure model.
+#     one distinct source                37.9%  — five times the rate that retired
+#                                        the last guard
+#     one source + a universal claim     20.6%  — fires on "none of it refuses
+#                                        anything", on a quoted spec
+#     ZERO reads + a universal claim      2.6%  <- this one
+#
+# It is a CONJUNCTION of two mechanical facts and neither is a judgment: the turn
+# ran no read (a count), and the reply asserts absence (a closed vocabulary).
+# Neither half works alone. Zero reads alone is 11.2% and usually CORRECT —
+# answering from context already in hand is directive two's own instruction.
+#
+# And it is where the failures actually were. Every claim a human had to correct in
+# the session that produced this file was a statement about what is NOT there,
+# written in a turn that looked at nothing: "this repo carries no org and does not
+# need one"; "vendor is the only documented path"; a command assumed deprecated.
+#
+# WHY IT REPORTS AND NEVER BLOCKS. StepShield (arXiv 2601.22136, NeurIPS 2026)
+# measured a 847-rule pattern guardrail at 86% recall whose intervention TIMING was
+# statistically indistinguishable from random (EIR 0.23 vs 0.24, p=0.66), because
+# "regex guardrails detect syntax, not intent". This is a regex. A 2.6% rate is
+# cheap enough to be worth printing and nowhere near good enough to gate a turn on.
+# THE PHRASE MUST BE ABOUT THE PROJECT, not about the ask or the work just done.
+# Two false positives on the first build, and both were the same shape: "Nothing else
+# changed" is a REPORT, and "the only sensible reading of your ask" is about the ASK.
+# Neither is a claim about what the tree contains. So the universal phrase must be
+# followed, within a short window, by something the tree could answer for — a file, a
+# command, a hook, a procedure. That window is what separates a claim from a turn of
+# phrase, and it costs one regex rather than a judgment.
+_ABSENCE_PHRASE = (r"the only|no other|the sole|only way|only place"
+                   r"|there is no|there are no|does(?:n't| not) need|was never|were never")
+
+# ── the unenumerated-universal trigger ───────────────────────────────────────
+# The SECOND trigger, and it covers the class the first one cannot: a claim with a
+# TRUE citation that is still wrong.
+#
+# MEASURED, this session. "Vendor is the only documented path for a remote repo" was
+# cited to scopes.md:140 and update.md:41 — both true statements, both ABOUT VENDOR.
+# The claim was about the SPACE OF ALTERNATIVES, and no read ever enumerated that
+# space; README.md's published one-liner was never opened. The citation's scope did
+# not cover the claim's scope, and a human had to catch it.
+#
+# The mechanical distinction is between two kinds of read:
+#     POINT read  answers "what does X say?"        Read(file), grep for a known term
+#     SET read    answers "what is the set of Y?"   Glob, find, ls, grep -rl, a census
+# A universal claim is a claim about a SET. Point reads cannot support one, however
+# many of them there are — that turn had four.
+#
+# RATES over 1,497 substantive Opus 5 turns:
+#     universal claim anywhere                        28.7%
+#     ...with no set-read in the turn                  2.1%
+#     ...and not inside quoted text                    1.5%   <- this one
+# The quote exclusion is not tidiness: without it the trigger fires on a turn
+# DISCUSSING the failure rather than committing it, which is common in exactly the
+# sessions where it would be read.
+#
+# WHAT IT CANNOT DO. ProvenanceGuard (arXiv 2606.18037) measures source-attribution
+# accuracy falling to 0.229 with semantically close sources — and two files in one
+# repository are close. So this flags that a set-claim rests on point reads; it does
+# NOT establish which source should have been consulted, and must never be reported
+# as if it did.
+_QUOTED = re.compile(r"[\"\u201c\u201d][^\"\u201c\u201d\n]{6,200}[\"\u201c\u201d]")
+
+# Tools and commands that ENUMERATE a set rather than answer about a known thing.
+# Commands that OPEN a target rather than being one. Without this, `timeout 900 ./bin/check`
+# contributes `timeout` and the real target is never counted.
+WRAPPERS = frozenset((
+    "timeout", "nohup", "sudo", "env", "xargs", "command", "exec", "time",
+    "cd", "then", "do", "done", "fi", "else", "until", "while", "for", "if",
+    "echo", "printf", "true", "false", "set", "local", "export",
+    "python3", "python", "node", "bash", "sh", "zsh", "perl", "ruby",
+))
+
+SET_TOOLS = {"Glob"}
+# A Bash command that ENUMERATES rather than point-reads. The flags matter: `grep -l`,
+# `-c`, `-n`, `-r` and `-o` all report across a whole file or tree, which is what closes a
+# claim about a set.
+#
+# *Widened 2026-09-10. The list held `find|ls|tree|grep -rl|grep -l|git ls-files|comm` and
+# BLOCKED A TURN THAT HAD ENUMERATED THE MANIFEST TWICE — with `grep -c` and `grep -nE`,
+# neither of which it recognised. A guard that refuses the very work it demands costs its
+# reader a round trip and teaches them the guard is noise, which is the 7.0% failure that
+# retired the speech guards arriving through a narrow allowlist instead of a broad regex.
+# The fix is to match on the FLAG, not on a hand list of spellings.*
+SET_CMD = re.compile(
+    r"\b(?:find|ls|tree|comm|git ls-files|git grep)\b"
+    r"|\bgrep\b[^|;\n]*?\s-[A-Za-z]*[lcnro]"
+    r"|\brg\b[^|;\n]*?\s-[A-Za-z]*[lc]"
+    r"|\bwc\s+-l\b")
+
+_PROJECT_NOUN = (r"file|files|script|scripts|command|commands|hook|hooks|procedure|procedures"
+                 r"|path|paths|skill|skills|agent|agents|handbook|handbooks|org|repo|repository"
+                 r"|reference|references|manifest|assertion|assertions|check|checks|employee")
+# THE NOUN MAY SIT ON EITHER SIDE. Looking only forward lost the very claim that
+# started this work — "this repo carries no org and does not need one" puts `repo` and
+# `org` BEFORE the phrase. A window that only reads rightwards is a filter narrower
+# than its question, which is the defect this project keeps finding in its own guards.
+_NOUN_THEN_PHRASE = rf"\b(?:{_PROJECT_NOUN})\b[^.\n]{{0,70}}?\b({_ABSENCE_PHRASE})\b"
+_PHRASE_THEN_NOUN = rf"\b({_ABSENCE_PHRASE})\b[^.\n]{{0,70}}?\b(?:{_PROJECT_NOUN})\b"
+ABSENCE = re.compile(rf"{_PHRASE_THEN_NOUN}|{_NOUN_THEN_PHRASE}", re.I)
+_UNIV_PHRASE = (r"the only|no other|the sole|only way|only place|there is no"
+                r"|there are no|does(?:n't| not) need|was never|were never")
+UNIVERSAL = re.compile(
+    rf"\b({_UNIV_PHRASE})\b[^.\n]{{0,70}}?\b(?:{_PROJECT_NOUN})\b"
+    rf"|\b(?:{_PROJECT_NOUN})\b[^.\n]{{0,70}}?\b({_UNIV_PHRASE})\b", re.I)
+
+# ── the quantified-claim grammar (seats a juror, never blocks) ─────────────────
+# A claim about a WHOLE SET in any domain, not only near a project noun: "none of the X",
+# "the only X we have", "no X has/shows", "not one". MEASURED 2026-11-09 over every judged
+# reply: 7.8% of 1,238 on mutze-studio's 40 newest transcripts, 13.5% of 415 on this
+# repository's, 10 of 15 sampled hits in each a real set claim (`senses.md` § Quantified
+# and relayed claims). Far above what a BLOCK can bear (7.0% retired a guard), so it only
+# seats the taste juror (`wf-widen` JURY_ONLY_TRIPS). Bare "the only" (6.4%) is excluded:
+# it is the shipped UNIVERSAL phrase's job near a project noun, and alone it is mostly prose.
+_QDET = r"(?:the|our|my|your|these|those|its|their|them|us|all)"
+QUANTIFIED = re.compile(
+    rf"\bnone of {_QDET}\b"
+    r"|\bthe only (?:[a-z-]+ ){0,3}?[a-z-]+ (?:we|i|you|they|that|which|in|on|of|left|here|there)\b"
+    r"|\bno (?:[a-z-]+ ){1,4}?(?:has|have|had|shows?|showed|meets?|met|matches|matched|carries"
+    r"|carried|holds?|held|contains?|fits?)\b"
+    r"|\bnot (?:one|a single)\b", re.I)
+# A sentence carrying a count or a quantifier: what makes a relayed sentence a CLAIM.
+CARDINAL = re.compile(r"\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten"
+                      r"|eleven|twelve|both|all|every|each)\b", re.I)
+
+_FENCE = re.compile(r"```.*?```", re.S)
+_CODE = re.compile(r"`[^`\n]*`")
+
+
+def mask_code(text):
+    text = _FENCE.sub(lambda m: " " * len(m.group(0)), text)
+    return _CODE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def emit(message):
+    """systemMessage — the channel the USER sees. That is the whole point."""
+    print(json.dumps({"systemMessage": message}))
+
+
+def read_targets(name, inp):
+    """What a tool call actually LOOKED AT, for the distinct count.
+
+    *Rewritten 2026-09-10, because the old expression took the first token of a Bash
+    command and so counted SHELL UTILITIES, not sources. Measured on one real turn:
+    `20 reads · 8 distinct` where the eight were `timeout, grep, sed, python3, git, until,
+    cat, nohup`. Forty greps across forty files scored 1; six utilities against one file
+    scored 6. The number was not merely uninformative, it was close to inverted — and it
+    was printed beside a label a reader reasonably read as "consulted 8 sources".*
+
+    For a real tool the field IS the target. For Bash the target is any path-like or
+    dotted argument in the command, with the wrapper verbs that open one dropped.
+    """
+    if name != "Bash":
+        t = str(inp.get("file_path") or inp.get("pattern") or inp.get("query") or "").strip()
+        return [os.path.basename(t)[:40]] if t else []
+    cmd = str(inp.get("command") or "")
+    out = []
+    for tok in re.findall(r"[\w./\-]+", cmd):
+        if tok in WRAPPERS or tok.startswith("-"):
+            continue
+        if tok in (".", "..", "./") or set(tok) <= set("."):
+            continue                       # `--root .` names no source
+        if "/" in tok or "." in tok:
+            base = os.path.basename(tok.rstrip("/"))
+            if base:
+                out.append(base[:40])
+    return out
+
+
+def current_turn(lines):
+    """Index of the row that opens THIS turn: the last genuine user message, else 0.
+
+    THE CURRENT TURN ONLY. A ledger spanning the whole session would grow monotonically
+    and stop meaning anything, which is the dormancy shape enforcement.md refuses.
+    """
+    for i in range(len(lines) - 1, -1, -1):
+        try:
+            d = json.loads(lines[i])
+        except Exception:
+            continue
+        if d.get("type") != "user":
+            continue
+        c = d.get("message", {}).get("content")
+        # A tool RESULT is recorded as a user row; it is not a user turn.
+        if isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+            continue
+        return i
+    return 0
+
+
+# ── the reply is CONFIRMED before anything judges it ─────────────────────────
+# `last_assistant_message` IS NOT ALWAYS THE REPLY. MEASURED 2026-09-13: widen flags on this
+# machine held "push it" (session a46eaa5b, the 1.55.0 wrap) and "Reading wf-widen and
+# wf-commitments" (session 16fe43d4, written nine seconds AFTER that turn's own Stop
+# summary). Neither is message text in any transcript here, and the claude-enforcer
+# reports add "push it" and "commit and push it". Claude Code 2.1.268 builds the field
+# from the last assistant message of the message list the Stop was fired with
+# (`Pr(Pg(messages).message.content," ").trim()` in its binary), so a side query that
+# fires the Stop hooks with its own list hands over its own output. `wf-widen` stored one
+# as the jury's conclusion, and the jury blocked a turn on a phrase the user never saw.
+#
+# THE RULE IS THE HOST'S OWN DEFINITION: the field counts only when it equals the text of
+# the transcript's last assistant row, whitespace-normalised because the host trims and
+# joins a row's text blocks with one space. The last row of the FILE, not of the turn: a
+# user message typed while the hooks run lands after the reply and would move the turn.
+#
+# THE WAIT COMES FROM THE WRITER. The host batches transcript appends on a 100ms timer
+# (`FLUSH_INTERVAL_MS=100`, same binary), which is the lag the hooks reference warns of.
+# One re-read after 500ms, five of those intervals, and only when the first read did not
+# match, so a confirmed reply costs nothing.
+REPLY_WAIT = 0.5
+_CONFIRMED = {}
+
+
+def reply_transcript(payload):
+    """The transcript holding THIS stop's reply: on SubagentStop, the subagent's own.
+
+    The host fills `transcript_path` from the session, so on SubagentStop it is the PARENT's,
+    and `agent_transcript_path` is the finishing agent's. Against the parent's, a subagent's
+    reply would be compared with the parent's narration.
+    """
+    key = "agent_transcript_path" if payload.get("hook_event_name") == "SubagentStop" \
+        else "transcript_path"
+    p = payload.get(key)
+    return p if isinstance(p, str) else ""
+
+
+def _read_lines(path):
+    """The transcript's lines, or None when there is no file to read."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
+    except OSError:
+        return None
+
+
+def last_assistant_blocks(lines, start=0):
+    """The content blocks of the last assistant row at or after `start`, or []."""
+    for line in reversed(lines[start:]):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            continue
+        m = d.get("message")
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            return [{"type": "text", "text": c}]
+        return [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
+    return []
+
+
+def _texts(blocks):
+    return [b["text"] for b in blocks if b.get("type") == "text" and isinstance(b.get("text"), str)]
+
+
+def confirmed_reply(payload):
+    """The stop's final reply and how it was established: (reply, how).
+
+      confirmed   the field is the transcript's last assistant row
+      unmatched   it is not, even after the wait; reply is None and nothing may judge it
+      unverified  no transcript file to check against, so the field stands unchecked
+      absent      no field; the reply is the text that ENDED the last row, or ""
+
+    Memoised per process, so a hook that asks twice waits once.
+    """
+    field = payload.get("last_assistant_message")
+    path = reply_transcript(payload)
+    key = (path, field if isinstance(field, str) else None)
+    if key in _CONFIRMED:
+        return _CONFIRMED[key]
+    lines = _read_lines(path)
+    if not isinstance(field, str) or not field.strip():
+        # THE LAST BLOCK, NOT EVERY BLOCK. The fallback has to MEAN what the field means —
+        # "what the turn told the user" — and joining every text block in the turn does not:
+        # on a long turn that is dozens of mid-turn narrations, and the thing a reader calls
+        # "the conclusion" is buried somewhere in the middle of it. A jury handed that judges
+        # the conclusion against text the turn said forty tool calls earlier, and convicts on
+        # a sentence that was never the conclusion. A guard that misquotes is the guard that
+        # earns its way into being ignored (`references/senses.md` § Guidelines, on the one
+        # retired here at a measured 7.0% false-positive rate).
+        #
+        # AND ONLY TEXT THAT ENDED THE TURN. The host omits the field exactly when its last
+        # assistant message has no text, so the last text block ANYWHERE in the turn was, by
+        # construction, said before something else. Only text after the last row's final
+        # tool call counts; a row that ends on a tool call is mid-turn, or a reply not yet
+        # written.
+        blocks = last_assistant_blocks(lines, current_turn(lines)) if lines else []
+        called = [i for i, b in enumerate(blocks) if b.get("type") == "tool_use"]
+        said = _texts(blocks[called[-1] + 1:] if called else blocks)
+        out = (next((t for t in reversed(said) if t and t.strip()), ""), "absent")
+    elif lines is None:
+        out = (field, "unverified")
+    else:
+        out = (None, "unmatched")
+        want = " ".join(field.split())
+        for attempt in range(2):
+            if attempt:
+                time.sleep(REPLY_WAIT)
+                lines = _read_lines(path) or []
+            if " ".join(" ".join(_texts(last_assistant_blocks(lines))).split()) == want:
+                out = (field, "confirmed")
+                break
+    _CONFIRMED[key] = out
+    return out
+
+
+def turn_counts(payload):
+    """Walk THIS turn and return (reads, distinct, setreads, outside, direct, wrote, reply),
+    or None. `reply` is None when the field did not match the transcript
+    (`confirmed_reply`), and nothing may judge it then.
+
+    Split out of `main` so `wf-widen` scores the same turn off the same walk. Two
+    copies of a transcript reader is two things to keep in step, and the copy that
+    drifts is the one that reports wrong — which is the whole defect class this
+    distribution keeps finding in itself. Nothing here judges; it counts.
+    """
+    tpath = payload.get("transcript_path")
+    lines = _read_lines(tpath if isinstance(tpath, str) else "")
+    if lines is None:
+        return None
+
+    start = current_turn(lines)
+    reads, targets, setreads, outside, direct, wrote = 0, [], 0, 0, 0, 0
+    for line in lines[start:]:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        for b in d.get("message", {}).get("content") or []:
+            if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                continue
+            name = b.get("name") or ""
+            inp = b.get("input") or {}
+            # OUTSIDE is counted separately from reads because the measurement that
+            # built these hooks separates them: nine of ten escapes from a settled
+            # wrong reading came from outside the turn, none from re-reading inside
+            # it. A repository read and a spawned second opinion are not the same
+            # evidence, however alike they look in a raw tool count.
+            # WHAT THE TURN CHANGED. A read-only turn rarely needs an outside reader;
+            # a turn that rewrote the tree and matched no classifier is the risky one.
+            # Counted here, never judged here — `wf-widen` decides what to do with it.
+            if name in ("Edit", "Write", "NotebookEdit") or (
+                    name == "Bash" and WRITE_CMD.search(str(inp.get("command", "")))):
+                wrote += 1
+            if (name in OUTSIDE or name.startswith("mcp__")
+                    or (name == "Bash" and OUTSIDE_CMD.search(str(inp.get("command", ""))))):
+                outside += 1
+            # Bash counts as a read WITHOUT inspecting the command. A command that
+            # also mutates still looked at something, and the read is the half that
+            # gets asserted later. Over-counting a read is a smaller error than the
+            # classifier that produced it.
+            if name in READERS or name == "Bash":
+                reads += 1
+                # TOUCH, counted apart from sight. Running a thing and reading a
+                # document about the thing are different channels: this session found
+                # four scripts that every procedure described in detail and that no
+                # `ls` would have found. Prose said they worked; nothing had run them.
+                if name == "Bash":
+                    direct += 1
+                # A SET read enumerates; a POINT read answers about a known thing.
+                # Only the former can support a claim about a set.
+                if name in SET_TOOLS or (
+                        name == "Bash" and SET_CMD.search(str(inp.get("command", "")))):
+                    setreads += 1
+                targets += read_targets(name, inp)
+
+    # THE REPLY COMES FROM `last_assistant_message`, CONFIRMED AGAINST THE TRANSCRIPT.
+    # The transcript "is written asynchronously and may lag the in-memory
+    # conversation", so the hooks reference sends hooks to the field for the final
+    # text; the field is also sometimes a side query's output. `confirmed_reply` takes
+    # the text from the field and uses the transcript only to confirm it, re-reading
+    # once for the lag. The READ COUNT stays on the transcript, where lag is harmless:
+    # tool calls are recorded before the turn ends.
+    reply = confirmed_reply(payload)[0]
+    seen, uniq = set(), []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return reads, uniq, setreads, outside, direct, wrote, reply
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return 0
+    if payload.get("stop_hook_active"):
+        return 0
+
+    counts = turn_counts(payload)
+    if counts is None:
+        return 0
+    reads, uniq, setreads, _outside, _direct, _wrote, reply = counts
+    # An unmatched reply is not scanned: the counts below never read it, the scans do.
+    reply = reply or ""
+
+    terms = []
+    for m in JARGON.finditer(mask_code(reply)):
+        t = m.group(0)
+        if t not in terms:
+            terms.append(t)
+    tail = ("  ·  PLAIN: " + ", ".join(terms[:4]) + ("…" if len(terms) > 4 else "")) if terms else ""
+
+    if reads == 0:
+        # The conjunction. Absence asserted by a turn that looked at nothing is the
+        # one shape four measurements agreed on; every other turn with no reads is
+        # reported plainly and not flagged at all.
+        claim = ABSENCE.search(mask_code(reply))
+        if claim:
+            emit(f"GROUNDING  0 reads · asserts \"{claim.group(0)}\" — a claim about "
+                 f"what is NOT there, from a turn that looked at nothing." + tail)
+            return 0
+        emit("GROUNDING  0 reads this turn — answering from context already in hand."
+             + tail)
+        return 0
+
+    # DISTINCT SOURCES IS THE SIGNAL, not the raw count. Reading one file four times
+    # is not four pieces of evidence; it is one, looked at again. That is the shape of
+    # the failure this session logged: two documents in one repo read as corroboration
+    # when they were one instrument twice. Deduplicated in `turn_counts`, which is the
+    # single walk both this hook and `wf-widen` score from.
+    #
+    # THE SECOND TRIGGER. A universal claim rests on a SET, and point reads cannot
+    # support one however many there are. Quoted text is excluded so a turn DISCUSSING
+    # such a claim is not confused with one making it.
+    if setreads == 0:
+        u = UNIVERSAL.search(_QUOTED.sub(
+            lambda m: " " * len(m.group(0)), mask_code(reply)))
+        if u:
+            emit(f"GROUNDING  {reads} reads · {len(uniq)} distinct · 0 enumerating — "
+                 f"asserts \"{u.group(0)[:44]}\", a claim about a SET, from point "
+                 f"reads only.{tail}")
+            return 0
+
+    emit(f"GROUNDING  {reads} reads · {len(uniq)} distinct{tail}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

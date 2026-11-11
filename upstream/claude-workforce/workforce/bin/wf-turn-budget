@@ -1,0 +1,1313 @@
+#!/usr/bin/env python3
+"""wf-turn-budget — tell a capped employee it is near its turn limit, once, in time to write.
+
+THE DEFECT, MEASURED. Session `52aabcb1` in odyssey-alive dispatched 18 orders; the 2 that
+hit `maxTurns` were both BUILD orders, both had already finished and verified their main
+work, and both returned **no report at all**. One was cut at about call 42, during cleanup
+and verification. A cut-off is not a failure the orchestrator can read: the run simply
+stops, the manager sees nothing, and the finished work is unrecoverable because nobody
+wrote down what it was. The user's words, relayed 2026-10-12: *"see if there is anything we
+can do to fix this without degrading the current performance … this may be a performance
+booster. And by performance, I'm talking about quality of work, not how quick it's done."*
+
+WHY A HOOK AND NOT A SENTENCE IN A HANDBOOK. An agent cannot count its own turns — nothing
+in its context says which turn it is on — so a handbook clause asking it to watch the
+number is advisory in the shape this project has already measured as not firing (SKILL.md
+§ Directives, 2026-08-05: a rule nobody re-reads stops firing). A hook counts. The agent
+only has to act on what it is told.
+
+TURNS, NOT CALLS, AND THE DIFFERENCE DECIDES WHETHER THIS IS NOISE. Parallel tool calls
+share one turn, so calls >= turns always. MEASURED in the same session: an Invest-watch
+report order ran 42 CALLS and the hour-goals producer ran 44, both under a 40-TURN cap,
+and both finished. A per-call boundary would have stopped two runs that were fine, on
+their 33rd call. The count here is of distinct assistant messages carrying a `tool_use`,
+read from the subagent's own transcript.
+
+MEASURED ON CLAUDE CODE 2.1.296, 2026-10-12 (platform.md § MEASURED, fact 22a), and three
+of those facts contradict what the design was written from:
+
+  * `agent_id` is present on a PostToolUse payload from inside a subagent and ABSENT on
+    the main thread. That is the identity test, and `agent_type` is not: the docs record
+    `agent_type` on a `--agent` main thread too.
+  * `agent_type` is absent from a `type: "agent"` HOOK's own agent, which still carries
+    `agent_id` (`hook-agent-<uuid>`). So both keys are required before anything is read.
+  * There is NO `agent_transcript_path` on PostToolUse — that key exists on SubagentStop
+    only. `transcript_path` names the PARENT session's transcript. The subagent's own
+    transcript sits beside it at
+    `<dir of transcript_path>/<session_id>/subagents/agent-<agent_id>.jsonl`,
+    every row carrying `isSidechain: true` and `agentId`.
+  * `additionalContext` returned from this event DOES reach the subagent: it arrives as a
+    `hook_additional_context` attachment in the subagent's transcript, and the canary
+    subagent obeyed it on its next call.
+
+CHEAP ENOUGH FOR EVERY TOOL CALL IN EVERY SESSION, which is the licence it has to be in
+the default set. `PostToolUse` fires on every call the machine makes, most of them in the
+main thread of projects with no org at all. The main-thread branch exits before any
+filesystem access whatsoever — one dict lookup. An agent with no handbook costs one
+`lstat`, and an uncapped one (every Lead and CEO, which have no `maxTurns`) costs that
+plus a 4 KB read. Only a capped IC reaches the counter, and the counter reads the tail of
+the transcript from a stored byte offset rather than the file.
+
+THE STATE IS SCRATCH AND LIVES UNDER THE SYSTEM TEMP DIR, NEVER IN THE PROJECT.
+`.claude/workforce/work/` is gitignored only by projects whose own audit added the entry,
+and nothing workforce ships writes that entry — so a counter file there would show up in
+`git status` on every host that installed this and in `git add -A` on some of them. The
+state is a cache in both directions: the transcript is the source of truth, and state
+that cannot be read is discarded rather than trusted.
+
+NEVER RAISES, EXITS 0 FROM EVERY PATH. A hook that prints a traceback does it in front of
+the model on every tool call for the rest of the session, which is worse than the
+boundary it was trying to announce.
+
+Exit codes
+    0  always, from every path, including a payload it could not parse
+
+Usage
+    wf-turn-budget            # a PostToolUse hook; the payload arrives on stdin
+"""
+import json
+import os
+import re
+import sys
+
+
+# ── the two thresholds ───────────────────────────────────────────────────────
+# WARN is 80% of the cap. It is the one that matters: it arrives with a fifth of the
+# budget still unspent, which is enough turns to write an OUTPUT.md and a continuation
+# brief and still hand back. For the measured IC cap of 40 that is turn 32.
+#
+# FINAL is `maxTurns - 3`, and the 3 is the room to obey it. IT WAS `- 2`, AND THE
+# END-TO-END RUN OF COMMIT d782174 MEASURED WHY THAT IS ONE TOO FEW: a `maxTurns: 20` IC
+# took the final injection on turn 18, spent turn 19 writing `OUTPUT.md` and turn 20
+# writing `HANDOFF.md`, and the cap arrived before it could reply — so both files existed
+# on disk and the `HANDOFF` verdict never reached the manager, which is the silence this
+# hook exists to prevent, one layer in. A written file the manager was never told about is
+# not a hand-back. So the budget is three turns: ONE to write both files with parallel
+# `Write` calls, which FINAL_TEXT now asks for by name, one of slack for a write that has
+# to be retried, and one for the REPLY, which is the only part the manager receives.
+#
+# EXPRESSED AS A FRACTION OF THE CAP, NOT AS A NUMBER OF TURNS, because the cap is read
+# from the handbook and differs per employee. `(n * 4 + 4) // 5` is ceil(0.8n) without
+# importing math: 40 -> 32, 80 -> 64, 10 -> 8.
+def warn_at(max_turns):
+    return (max_turns * 4 + 4) // 5
+
+
+def final_at(max_turns):
+    return max_turns - 3
+
+
+# ── which allowance a cumulative count lands in ──────────────────────────────
+# ONE DEFINITION, READ BY BOTH HOOKS, BECAUSE THE TWO IT REPLACES DISAGREED. This file
+# scheduled round k's thresholds at `final_at(cap) + k * cap`, and `wf-widen` reported the
+# round as `ceil(turns / cap)`. Both assume a round ENDS on an exact multiple of the cap.
+# MEASURED 2026-10-13, session `68b82f98`, cap 10: the harness cut the agent on TURN 8 of
+# round 1, not on turn 10. Round 2's final threshold was therefore scheduled for turn 17,
+# the second cut arrived first, and THE RESUMED AGENT GOT NO FINAL NOTICE AND WROTE NO
+# BRIEF — the silence this hook exists to remove, one round in. Our count and the
+# harness's disagree whenever a turn is not a tool call, so with a cap of 80 the same
+# drift opens on every resume.
+#
+# SO A ROUND IS ANCHORED TO WHERE THE PREVIOUS ONE ACTUALLY ENDED, which is a fact the
+# agent's own transcript already records: a `SendMessage` resume appends a new PROMPT row
+# to it, and the turn count standing at that row is where the next allowance begins
+# (`count_turns`). `round_start` is that number, stored beside the count in `count.json`.
+# Round k's thresholds are then `round_start + warn_at(cap)` and `round_start +
+# final_at(cap)`, so the final notice lands three turns before the limit in EVERY round
+# rather than only the first.
+#
+# THE CAP-MULTIPLE MODEL SURVIVES AS THE BACKSTOP, and it is what makes the anchor safe to
+# ship against state written without it. `round_start` is 0 for a run that was never cut,
+# and round 1 then behaves exactly as it did; it is also 0 in a counter the previous
+# release wrote. When the count has outrun a whole allowance from the anchor, the anchor is
+# missing or stale, so the ceiling division answers instead — the number the last release
+# printed, for the state it left behind. The direction of the error stays the one this hook
+# already chose: an early boundary costs one extra written hand-back, a late one costs the
+# run.
+def counted(state, key):
+    """One stored counter off `count.json`, validated WHERE IT IS READ.
+
+    The counter sits in scratch another account on the host can reach, so a string, a
+    float or a negative on any key reads as 0 rather than raising inside a hook — and
+    `wf-widen` reads the same file for itself, so the validator is shared rather than
+    stated twice with two ideas of what a count is.
+    """
+    v = state.get(key) if isinstance(state, dict) else None
+    return v if isinstance(v, int) and v >= 0 else 0
+
+
+def turn_round(state, cap):
+    """`(turn within this allowance, which allowance, the count the allowance started at)`.
+
+    1-BASED ON BOTH NUMBERS. Allowance 1 is the first one, and the turn inside it is never
+    0 after the first call of a round and never past the cap. `wf-widen` prints both in the
+    performance record it files, and this hook keys its claim markers on `allowance - 1`,
+    so round 0 keeps the marker name it had before any round was counted.
+    """
+    turns, start, rounds = (counted(state, "turns"), counted(state, "round_start"),
+                            counted(state, "round"))
+    if not isinstance(cap, int) or cap < 1:
+        return turns, 1, 0
+    if start > turns:
+        start = 0        # state that cannot be true is discarded, as `read_state` does
+    spent = turns - start
+    if spent > cap:
+        extra = (spent + cap - 1) // cap - 1
+        rounds += extra
+        spent -= extra * cap
+        start = turns - spent
+    return spent, rounds + 1, start
+
+
+def keyed(marker, round_):
+    """The claim name for one round of `marker`.
+
+    ROUND 0 KEEPS THE BARE NAME, so a marker file written before rounds were counted is
+    still read by the release that counts them. One definition because three places build
+    this name — the claim, the walk back over the claims, and the test for whether the
+    current round's notice has already gone out — and a fourth spelling of it is how a
+    resumed agent ends up claiming a marker nobody looks for.
+    """
+    return marker if round_ <= 0 else "%s-%d" % (marker, round_)
+
+
+def final_pending(home, state, cap):
+    """True when THIS round's warning or final notice has already gone out.
+
+    IT IS WHAT LICENSES A PROMPT ROW TO BE READ AS A NEW ALLOWANCE (`count_turns`'s
+    `pending`), so both readers of the transcript have to answer it the same way: the
+    `PostToolUse` writer before it folds its tail, and `wf-widen`'s stop before it folds
+    the one the writer never got to. A second spelling of the marker name here is how a
+    resumed agent's round boundary lands in one hook and not in the other.
+
+    `home` IS THE VERIFIED COUNTER DIRECTORY or "", and "" is False: with no directory
+    there is no marker to ask, and the cap-multiple backstop in `turn_round` answers
+    instead — the direction this hook has already chosen everywhere else.
+    """
+    # EITHER NOTICE ENDS A ROUND. The warning itself tells the agent to write HANDOFF.md and
+    # return, so an agent that obeys it stops at 80% and never sees the final notice.
+    # MEASURED 2026-10-14: a coder handed off at the warning (turn 64 of 80), was resumed,
+    # and was cut again at turn 77, because only the final marker licensed the resume as a
+    # new allowance and the count ran on from zero.
+    if not home:
+        return False
+    k = turn_round(state, cap)[1] - 1
+    return any(os.path.exists(os.path.join(home, keyed(m, k)))
+               for m in ("fired-final", "fired-warn", HANDBACK_MARK))
+
+
+# ── the continuation brief's shape ───────────────────────────────────────────
+# THESE SEVEN HEADINGS ARE A CONTRACT WITH `org.md` RUNG 12b, which is the consumer that
+# reads the brief and RESUMES THE SAME AGENT from it (e06d730; a fresh agent of the role
+# starts the work over, which is the defect K8 removes). Rung 12b verifies "sections 3-7
+# filled, the work order in section 1 reproduced verbatim", and before 2026-10-12 that
+# pointed at a format defined in no file on disk — `wf-handoff`, the producer, had been
+# retired in the simplification release, so `HANDOFF` had a consumer and nothing that
+# could satisfy it. `bin/check` requires these exact lines to appear in both files.
+BRIEF_SECTIONS = """1. The work order, verbatim — the `REQUEST (verbatim):` block unchanged, never summarised
+2. Exit criteria, each MET or UNMET, with its evidence
+3. What is done, and the file or command that shows it
+4. What is left, as the next concrete action; for a job still running, its log path and the line that means it finished
+5. What must not be redone, named file by file
+6. The commands to re-run, and what each returned last
+7. What went wrong or blocked, and what to try instead"""
+
+# THE INSTRUCTION LIVES HERE AND NOWHERE ELSE. A second copy in a handbook template or in
+# settings.json is the copy that drifts, and it is the one no check on a stranger's
+# machine can reach.
+WARN_TEXT = """TURN BUDGET — you are at turn {turns} of {cap}, which is 80% of your limit.
+
+The limit is enforced by the harness: when it arrives your run ENDS mid-sentence, your
+manager receives no report, and every verified thing you have not written down is lost.
+This is the only notice you get, and you cannot count your own turns.
+
+IF YOUR WORK IS ALREADY COMPLETE: finish normally, as your handbook says. Ignore the rest.
+
+IF A JOB YOU STARTED IS STILL RUNNING (a render, a build, anything in the background):
+do not wait for it and do not poll it. Hand back now, with its log path and the line that
+means it finished in section 4 of the brief. Your manager watches for that line and
+resumes you when it appears; nothing else will wake you.
+
+OTHERWISE, START NO NEW WORK and do these three things now, in this order:
+
+1. Write your `OUTPUT.md` at the path your handbook names, with every exit criterion
+   marked MET or UNMET and the evidence for each. State UNMET rather than omitting it.
+2. Write a continuation brief named `HANDOFF.md` in THE SAME DIRECTORY as that
+   `OUTPUT.md` — not at the root of the project — with these seven sections, all filled:
+{sections}
+3. Return `HANDOFF <path to your OUTPUT.md>` as your verdict, and in that same reply say
+   in plain words: RESUME ME with SendMessage — do not start this over with a new agent.
+
+`HANDOFF` ASKS YOUR MANAGER TO RESUME YOU. It hands your work to nobody, and your brief
+is not an order for a replacement. Your manager answers it with `SendMessage` to YOU, and
+you continue from that brief with a fresh turn allowance and the context you have already
+paid for still in place (`org.md` rung 12b). A turn cap is a checkpoint, not an ending. A
+fresh employee of your role is spawned only if you report your context exhausted, and the
+work starts over when that happens — which is why your reply has to name the resume. What
+you cannot do is give yourself more turns, so a brief you do not write is work that
+simply stops."""
+
+FINAL_TEXT = """TURN BUDGET — turn {turns} of {cap}. RETURN NOW, with whatever exists.
+
+Three turns left. Write nothing new and verify nothing more.
+
+BOTH FILES IN ONE TURN. Send two `Write` calls in a SINGLE message, in parallel — one
+file per turn is how this run ends a sentence short of handing anything back:
+
+* `OUTPUT.md`, at the path your handbook names, each exit criterion MET or UNMET.
+* `HANDOFF.md`, in THE SAME DIRECTORY as that `OUTPUT.md` — not at the root of the
+  project — with these seven sections, all filled:
+{sections}
+
+THEN REPLY `HANDOFF <path to your OUTPUT.md>`, then one line: RESUME ME with SendMessage,
+do not start this over with a new agent. Nothing else. That reply is the only part your
+manager receives — files you wrote and never named are files nobody reads, and a manager
+told only that you stopped spawns somebody else to redo the work you already did. A
+partial account replied beats a complete one the limit cuts off."""
+
+# WHAT A DELIVERED INJECTION LOOKS LIKE IN THE TRANSCRIPT, which is how the once-only rule
+# survives with no counter directory. DERIVED FROM THE TEXTS rather than restated beside
+# them: a second copy of the opening line is a literal that drifts the first time the
+# wording is improved, and the symptom would be the paragraph repeating on every call.
+WARN_MARK = WARN_TEXT.split("{turns}")[0]
+FINAL_MARK = FINAL_TEXT.split("{turns}")[0]
+
+# AND WHAT EITHER OF THEM LOOKS LIKE ON A ROW THAT IS NOT A TURN. A delivered injection
+# arrives in the agent's own transcript as a `hook_additional_context` attachment, so the
+# row that carries it is neither a turn nor the new prompt that starts a round — it is the
+# signal that the round it was sent in is ending. DERIVED FROM THE TWO TEXTS, like the
+# marks above: a third copy of the opening line is the one that drifts the first time the
+# wording improves.
+#
+# ASCII ONLY, AND THAT IS NOT TIDINESS. The common prefix ends in an em dash, and a
+# transcript writer that escapes non-ASCII spells it `\\u2014`, so a needle carrying the
+# character itself would match nothing on that host. Everything up to it matches either
+# spelling.
+#
+# AND IT IS NEVER ALLOWED TO BE EMPTY. `b"" in raw` is true of every row, which would read
+# every round as ending; a prefix the two texts no longer share would produce exactly that.
+# The final notice's own head is the fallback, because that is the injection this exclusion
+# exists for.
+BUDGET_MARK = (os.path.commonprefix([WARN_MARK, FINAL_MARK])
+               or FINAL_MARK).encode("ascii", "ignore").rstrip()
+
+# ── the call that ends a run ─────────────────────────────────────────────────
+# A HAND-BACK IS THE LAST CALL OF A RUN, SO A NOTICE ON IT IS READ BY THE NEXT ONE. MEASURED
+# 2026-10-30, odyssey-alive session `be539307`, design-evaluator `a4cc76dc67d9761e0`, cap 40:
+# run 1 handed back a FAIL report with `SubagentHandback` on its 38th call, and this hook's
+# `PostToolUse` for THAT call was the one that crossed `final_at` (count 37, one row behind).
+# The final notice landed after the report had already gone. The parent then resumed the
+# agent with a NEW order, and the newest budget text in its context was "RETURN NOW … Three
+# turns left", from a run that was over. It obeyed: wrote HANDOFF.md on its first call and
+# handed back without starting the work. The counter itself had the right answer (round 1
+# opened at 38); the agent was reading a notice from the previous run.
+#
+# SO THIS CALL GETS NO NOTICE AND NO MARK, and the row that carries it is a round boundary
+# just like a delivered notice: the harness gives a resumed agent a fresh allowance (that
+# agent ran 52 turns against a cap of 40, and `aab6052464b402b32` ran 60), so the next prompt
+# row after a hand-back starts one. A message that arrives mid-run, with no hand-back before
+# it, still opens nothing; a run the harness CUT has no hand-back row, and its resume is
+# licensed by the notice as before.
+HANDBACK_TOOL = "SubagentHandback"
+HANDBACK_MARK = "handed-back"
+
+# AND A RUN ALSO ENDS WHEN THE AGENT ENDS ITS TURN WITHOUT A CALL: the assistant row's
+# `stop_reason` is `end_turn`. MEASURED on 2.1.314 with a `maxTurns: 3` probe
+# (`measurements/2026-10-30-turn-allowance-after-mid-run-rows.md`): an agent that replied
+# `WAITING` and stopped was woken by its background task's notification and then made three
+# more calls before the cap cut it, five turns against a cap of three; an agent woken the
+# same way by a parent's `SendMessage` ran on likewise. So a prompt row after an `end_turn`
+# is a new allowance, exactly as after a hand-back. A run the harness CUT ends on a tool
+# call, never on `end_turn`, and its resume is still licensed only by the notice.
+END_TURN = "end_turn"
+
+
+# ── a job started in the last fifth of the budget ─────────────────────────────
+# MEASURED 2026-10-22, mutze-studio run `org-20261022T115924Z-necklacescale`: an IC took
+# the 80% notice on turn 32, launched two renders with `nohup … &` on its NEXT call, and
+# handed back. Both renders finished and nothing woke it or its manager; the results sat
+# unread for about 20 minutes. The notice had gone out before the job existed, so it could
+# not mention it. This one is said on the call that starts the job, once per round, and
+# only at or past the 80% mark: earlier, a background job is ordinary work.
+#
+# IT DETECTS THE LAUNCH, NOT THE JOB. Whether a process is still alive is not something a
+# hook can tie to one agent, so the text is conditional and the agent, which knows what it
+# started, decides. Its first words are not the budget prefix on purpose: `count_turns`
+# reads a row carrying `BUDGET_MARK` as a round ending, and this notice must not move that.
+JOB_TEXT = """BACKGROUND JOB, near your turn limit. This call started a job in the background.
+Do not wait for it and do not poll it: polling spends the turns you have left. Hand back
+now, with the job's log path and the line that means it finished in section 4 of your
+HANDOFF.md. Your manager watches for that line and resumes you when it appears; nothing
+else will wake you."""
+JOB_MARK = JOB_TEXT.split(",")[0]
+
+# A HEREDOC BODY OR A QUOTED STRING IS TEXT, NOT A COMMAND, and the IC in the measured run
+# wrote its OUTPUT.md through a heredoc. Both are removed before the `&` test, so a line of
+# prose ending in " &" is not read as a launch.
+#
+# ONE LINEAR PASS, NOT A SUBSTITUTION REGEX. The command is the agent's, and it can carry
+# text the agent fetched. A quoted-string pattern with an alternation inside a repeat took
+# a MEASURED 73 s on 100 KB of `\"` with no closing quote, in a hook the harness waits on.
+# Every character here is visited once, and an unclosed quote or heredoc runs to the end.
+HEREDOC_HEAD_RX = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1")
+# A lone `&` ending a command: not `&&`, `|&`, `>&`, `&>` or `\&`, and followed by a space,
+# a `)` or the end of a line. `nohup`, `setsid` and `disown` count where a command starts.
+BACKGROUND_RX = re.compile(
+    r"(?<![&|>\\])&(?=[ \t)]|$)|(?:^|[;&|(])[ \t]*(?:nohup|setsid|disown)\b", re.M)
+
+
+def code_only(command):
+    """`command` with its quoted strings and heredoc bodies removed."""
+    out, i, n = [], 0, len(command)
+    while i < n:
+        c = command[i]
+        # `<<<` is a here-string, not a heredoc, so a `<` right after a `<` opens nothing.
+        head = (HEREDOC_HEAD_RX.match(command, i)
+                if c == "<" and command[i - 1:i] != "<" else None)
+        if c == "'":
+            j = command.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            out.append("''")
+        elif c == '"':
+            j = i + 1
+            while j < n and command[j] != '"':
+                j += 2 if command[j] == "\\" else 1
+            i = j + 1
+            out.append("''")
+        elif head:
+            i = command.find("\n", head.end())
+            i = n if i < 0 else i + 1
+            while i < n:                      # skip the body, through its closing line
+                eol = command.find("\n", i)
+                eol = n if eol < 0 else eol
+                line, i = command[i:eol], eol + 1
+                if line.strip() == head.group(2):
+                    break
+            out.append("\n")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def launched_background(payload):
+    """True when this `Bash` call started a job in the background."""
+    if payload.get("tool_name") != "Bash":
+        return False
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    if tool_input.get("run_in_background") is True:
+        return True
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    return bool(BACKGROUND_RX.search(code_only(command)))
+
+
+# `agent_type` ARRIVES IN A PAYLOAD AND BECOMES A PATH, so it is validated as a bare
+# name and never sanitised into one. Same shape as `wf-org-sync`'s AGENT_SLUG_RX, plus an
+# explicit `..` refusal: the leading-character class already blocks a bare `..`, and this
+# blocks `a..b` shapes too rather than reasoning about which of them are reachable.
+#
+# IT REJECTS WHERE `wf-task-tag`'s `session_component` SANITISES, and it is a separate
+# function rather than an import of that one. Both halves are deliberate:
+#
+#   * REJECTING is right here because every name this validates — `agent_id`,
+#     `agent_type`, `session_id` — decides whether anything is read or written AT ALL.
+#     `agent_type` becomes `.claude/agents/<name>.md`; a name this cannot vouch for means
+#     no cap, which means no boundary, which is the silent direction. `wf-task-tag` has to
+#     produce a usable filename for a tag it must store, so substitution is right there.
+#   * NOT IMPORTING, because loading that sibling to borrow one function costs a MEASURED
+#     +35 ms at best and +115 ms under load, per call, on a hook that fires on every tool
+#     call of every session. The hook's own total cost is in that range, so the import
+#     would more than double it. A local validator defined per script is also the house
+#     pattern for exactly this reason — `config_root()` is defined privately in eight
+#     other shipped scripts rather than shared.
+BARE_NAME_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MAX_TURNS_RX = re.compile(r"^maxTurns:\s*(\d+)\s*$", re.M)
+# The frontmatter is at the head of the file and a handbook is tens of kilobytes. Reading
+# 4 KB answers the only question asked of it.
+FRONTMATTER_BYTES = 4096
+
+
+def bare(name):
+    """True when `name` is safe to join into a path as one component."""
+    return (isinstance(name, str) and ".." not in name
+            and bool(BARE_NAME_RX.match(name)))
+
+
+def config_root():
+    """The personal config root, which is where a user-scope agent registration lands."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+
+
+def read_cap(root, agent_type):
+    """The `maxTurns` in this agent's handbook, or None.
+
+    PROJECT SCOPE FIRST, THEN PERSONAL. An employee is registered at
+    `.claude/agents/<name>.md` by `/workforce hire`, and the personal root is where
+    `install --personal` puts an `agent` row. A name that resolves in neither has no cap
+    and gets no boundary — which is most agents on most hosts, `general-purpose`
+    included.
+    """
+    for base in (os.path.join(root, ".claude", "agents"),
+                 os.path.join(config_root(), "agents")):
+        path = os.path.join(base, agent_type + ".md")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(FRONTMATTER_BYTES).decode("utf-8", "replace")
+        except OSError:
+            continue
+        if not head.startswith("---"):
+            continue
+        end = head.find("\n---", 3)
+        m = MAX_TURNS_RX.search(head[:end] if end > 0 else head)
+        if m:
+            try:
+                cap = int(m.group(1))
+            except ValueError:
+                continue
+            # A cap of 3 or less puts `cap - 3` at or before turn 0, so the final
+            # injection would fire on the very first call and there is nothing useful to
+            # say to such a run; a negative one is a typo. The bound moved with the
+            # threshold — it was `> 2` when the threshold was `cap - 2`, and it is the
+            # same statement: the boundary has to land at least one turn into the run.
+            # Left alone rather than clamped.
+            if cap > 3:
+                return cap
+    return None
+
+
+def agent_transcript(payload, session_id, agent_id):
+    """Where this subagent's own transcript sits, derived from the parent's path.
+
+    MEASURED 2026-10-12: PostToolUse carries no `agent_transcript_path` — that key is on
+    SubagentStop only — and `transcript_path` names the PARENT session. The subagent's
+    file is a sibling directory of it, keyed by session then by agent.
+    """
+    parent = payload.get("transcript_path")
+    if not isinstance(parent, str) or not parent:
+        return ""
+    return os.path.join(os.path.dirname(parent), session_id, "subagents",
+                        "agent-" + agent_id + ".jsonl")
+
+
+#
+# WHAT COUNTS AS WORK THE AGENT PRODUCED, which is the progress signal the stall guard
+# needs and the reason this hook counts anything besides turns. MEASURED 2026-10-13
+# (session `68b82f98`): an IC wrote eight files in its first round and eight more in its
+# second and was flagged stalled at the second cut, because the only progress signal was
+# the issue's UNMET set — and the session had recorded no checklist, so both marks carried
+# the digest of the empty set. A report is not measurable either: it is named in a
+# handbook, this hook is told an `agent_id`, and in that run the report was never written
+# at all. What DOES exist at every cut is the agent's own transcript, so the files it wrote
+# are counted from the same read that counts its turns. NO SECOND OPEN: a new transcript
+# read here would be a second, unguarded door into a path assembled from payload text.
+#
+# THE WRITE TOOLS BY NAME, and the exact names rather than a pattern. A substring test
+# (`"Write" in name`) matches `TodoWrite`, which every agent calls and which produces
+# nothing; the opposite shortcut — "anything that is not a read" — counts `Bash`, where
+# `ls` and `rm -rf` are the same call. `MultiEdit` is kept although the host no longer
+# sends it, because a transcript recorded under an older harness is still read by this one.
+#
+# A COUNT OF CALLS, NOT OF DISTINCT PATHS, and the direction of the error is the reason.
+# This number decides whether an agent is called STALLED and handed to the user instead of
+# resumed, so the cheap mistake is to under-count progress: an agent that spent its round
+# re-editing three files it had already touched did work, and a distinct-path set would
+# call that round empty. One write in the round is progress; no write at all, with the
+# session's own UNMET set unmoved, is the stall the guard is for.
+WRITE_TOOLS = frozenset(("Write", "Edit", "MultiEdit", "NotebookEdit"))
+
+
+def count_turns(path, offset, needles=(), pending=False):
+    """What the tail of this agent's transcript says, as a dict:
+
+      turns        turns in the rows just read, or None when nothing could be read
+      off          the offset to resume from
+      seen         how many times each of `needles` appeared
+      writes       `WRITE_TOOLS` calls in those rows
+      rounds       ROUND BOUNDARIES in those rows — new allowances this agent was granted
+      round_start  the turn count standing at the last of them, within this read
+
+    A TURN IS AN ASSISTANT MESSAGE CARRYING A `tool_use`. An assistant row holding only
+    `thinking` is not a turn, and a row holding three `tool_use` blocks is one turn, which
+    is the whole reason this counts rows instead of calls.
+
+    A ROUND BOUNDARY IS A PROMPT ROW THAT FOLLOWS A DELIVERED NOTICE OR THE END OF A RUN, and
+    both halves of that are load-bearing. (A run ends on a hand-back, `HANDBACK_TOOL`, or on
+    an `end_turn`, `END_TURN`.) A
+    `SendMessage` resume appends a user row carrying TEXT, where
+    every ordinary user row in a subagent's transcript carries a `tool_result`; that row is
+    where the harness's new turn allowance begins, and it is the only thing on this host
+    that marks the end of the previous one. `pending` is the second half: a prompt row is
+    read as a boundary ONLY when the final notice for the current round has already gone
+    out. Nothing else on a transcript can then move the anchor mid-round, and a row of an
+    unforeseen shape costs at worst the cap-multiple backstop (`turn_round`) rather than a
+    notice postponed into silence. The cost is the same reason: the extra parse is reached
+    only after a notice has been delivered, which is once per round, so an ordinary call of
+    an ordinary capped agent pays one `in` test for it.
+
+    ONLY WHOLE LINES ARE CONSUMED. The host batches transcript appends on a 100 ms timer,
+    so the tail can be a half-written line; the offset advances to the last newline and
+    the partial line is re-read next call rather than parsed once and lost.
+
+    `needles` IS HOW THE ONCE-ONLY RULE SURVIVES WITH NO STATE FILE. A delivered injection
+    is recorded in the subagent's own transcript as a `hook_additional_context` attachment
+    (measured 2026-10-12), so the transcript can answer "did I already say this" when the
+    counter directory had to be refused. Only used on that path, where the read starts at
+    offset 0 and therefore covers the whole run.
+
+    IT COUNTS THE NEEDLES RATHER THAN NOTING THEM, because a RESUMED agent has to be able
+    to be told again (K8): one delivery per round, and the round is what the count is
+    compared against. A set could only ever answer "at least once", which would leave a
+    resumed run silent at its second cap — the run the user is waiting on.
+
+    `writes` RIDES ALONG ON THE SAME PARSE. It is the number of `WRITE_TOOLS` calls in the
+    rows just read, which is the progress signal `agent_handoff` needs and is free here:
+    the row is already decoded and its blocks already walked for the turn test.
+    """
+    # A REGULAR FILE, OR NOTHING. `os.path.isfile` is false for a FIFO, and the open below
+    # would otherwise BLOCK on one until a writer appeared — on every tool call, inside a
+    # hook the harness is waiting on. The directory part of this path comes from the
+    # payload's `transcript_path` and is not validated as a path (only the session and
+    # agent components are), so the name is reachable by anything that can set `cwd` or
+    # that path. `read_cap` takes the same guard, and it is the one `wf-turn-ledger`'s
+    # `_read_lines` has carried since it shipped.
+    unread = {"turns": None, "off": offset, "seen": {}, "writes": 0,
+              "rounds": 0, "round_start": 0}
+    if not path or not os.path.isfile(path):
+        return unread
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+    except (OSError, ValueError):
+        return unread
+    seen = dict((n, chunk.count(n.encode("utf-8"))) for n in needles)
+    cut = chunk.rfind(b"\n")
+    if cut < 0:
+        return dict(unread, turns=0, seen=seen)
+    turns = writes = rounds = start = 0
+    ended = False                             # the agent ended its turn (`END_TURN`)
+    for raw in chunk[:cut + 1].splitlines():
+        if b'"tool_use"' in raw or b'"end_turn"' in raw:   # cheap reject before any parse
+            try:
+                row = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if row.get("type") == "assistant":
+                message = row.get("message")
+                message = message if isinstance(message, dict) else {}
+                content = message.get("content")
+                calls = [b for b in content if isinstance(b, dict)
+                         and b.get("type") == "tool_use"] if isinstance(content, list) else []
+                if calls:
+                    turns += 1
+                    writes += sum(1 for b in calls if b.get("name") in WRITE_TOOLS)
+                    ended = False
+                    if any(b.get("name") == HANDBACK_TOOL for b in calls):
+                        pending = True        # the run ended here (`HANDBACK_TOOL`)
+                elif message.get("stop_reason") == END_TURN:
+                    ended = True
+                continue
+            # A USER ROW THAT MERELY QUOTES ONE OF THOSE WORDS falls through to the prompt
+            # test below rather than being dropped as an assistant row it is not.
+        if BUDGET_MARK in raw:
+            # THIS HOOK'S OWN INJECTION, arriving back as an attachment. Not a turn, not a
+            # prompt, and the one thing on the transcript that says the round is ending —
+            # which is what the no-state path has to read it for: there is no marker file
+            # there to ask.
+            pending = True
+            continue
+        # A PROMPT ROW IS A USER ROW WITH NO `tool_result` IN IT, tested on the raw bytes
+        # so an ordinary call parses nothing extra. The byte test is deliberately the
+        # whole of the `tool_result` refusal: a resume message that quotes the words
+        # `tool_result` is read as one of them and the backstop answers, where a parse
+        # that looked past it could read a tool result as a new allowance.
+        if not (pending or ended) or b'"tool_result"' in raw or b'"user"' not in raw:
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        # A ROW THE HOST ATTACHED TO THE TURN IN PROGRESS IS NOT A PROMPT. Calling `Skill`
+        # writes the skill's body as a user text row (MEASURED 2026-10-30, odyssey-alive
+        # `a4cc76dc67d9761e0` row 41), and reading an image writes `[Image: original …]` the
+        # same way. The host marks both: `sourceToolUseID` names the call that produced the
+        # row (all 457 skill loads on this machine carry it, no parent message does), and
+        # `turnCompanion` says it belongs to the current turn (the 142 mid-run image rows).
+        # Read as prompts, either one opened a round mid-run after a notice.
+        #
+        # AND A ROW THE HOST WRITES TO KEEP THE SAME RUN GOING IS NOT ONE EITHER: a meta row
+        # with no `origin`. MEASURED on 2.1.314 (`measurements/2026-10-30-turn-allowance-
+        # after-mid-run-rows.md`): `Stop hook feedback:` and `[handback-send-enforce]` both
+        # arrive that way, and an agent at its cap got ZERO turns after either. A parent's
+        # message and a task notification carry `origin` (399 of 399 coordinator rows on
+        # this machine) and each opened a fresh allowance.
+        if (row.get("type") != "user" or row.get("sourceToolUseID")
+                or row.get("turnCompanion")
+                or (row.get("isMeta") and not row.get("origin"))):
+            continue
+        content = (row.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = "".join(str(b.get("text") or "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text").strip()
+        else:
+            continue
+        if not text or not (offset or turns):
+            # THE FIRST PROMPT OF A TRANSCRIPT IS THE ORDER, NOT A RESUME, and a round
+            # cannot start on turn 0 because round 1 already did. The test is reached when
+            # a notice is pending and the read starts at the top of the file — the state a
+            # discarded or squatted counter leaves — and without it that re-read books the
+            # work order itself as a new allowance and every later round is off by one.
+            continue
+        rounds += 1
+        start = turns
+        pending = ended = False
+    return {"turns": turns, "off": offset + cut + 1, "seen": seen, "writes": writes,
+            "rounds": rounds, "round_start": start}
+
+
+def fold_tail(state, tail):
+    """Apply one `count_turns` read to the stored counters, in place. Returns `state`.
+
+    TWO HOOKS NOW FOLD THE SAME READ, which is why this is a function and not five lines
+    inside `main`. The `PostToolUse` writer folds a tail on every call; `wf-widen`'s
+    `SubagentStop` folds one more at the stop, because THE STORED COUNTER IS ALWAYS ONE
+    TURN SHORT THERE. MEASURED 2026-10-13, session `83ab658c`: `count.json` read
+    `{"turns": 23, "writes": 23}` against a subagent transcript holding 24 tool-call rows
+    and 24 `Write` calls, and exactly one unread assistant row sat past the stored `off`.
+    The host appends transcript rows on a 100 ms timer and a `Write` returns well inside
+    that window, so the row carrying the call this hook was fired FOR is not in the file
+    when it reads — the deficit is one at every moment, and the next call's read clears
+    it. A stop has no next call. The record filed off that counter said the agent stopped
+    at turn 3 of a round it had spent four turns in.
+
+    THE COUNTERS ARE NORMALISED FIRST, through `counted`, because one of the two callers
+    reads this state out of a world-writable directory: a string or a negative on `turns`
+    must become 0 rather than a `TypeError` inside a hook. After that one pass the
+    arithmetic below is plain, which is how the anchor line stays the same text in the one
+    place that writes it.
+
+    A TAIL THAT COULD NOT BE READ CHANGES NOTHING HERE, and the caller that has a fallback
+    applies its own: `main` books the call count, which errs toward an early hand-off,
+    while a stop has no call to book and keeps the number it was given.
+    """
+    for key in ("turns", "writes", "round", "round_start", "off"):
+        state[key] = counted(state, key)
+    if tail["turns"] is None:
+        return state
+    if tail["rounds"]:
+        # THE NEW ALLOWANCE STARTS WHERE THE PROMPT ROW STOOD, which is the turn count as
+        # of the previous read plus whatever this one counted before it.
+        state["round"] += tail["rounds"]
+        state["round_start"] = state["turns"] + tail["round_start"]
+    state["turns"] += tail["turns"]
+    state["writes"] += tail["writes"]
+    state["off"] = tail["off"]
+    return state
+
+
+# ── the counter directory, which lives in a place other people can write ─────
+# THE WHOLE TEMP-FILE CLASS, AND WHY A FALLBACK IS SAFE. On a shared host the system temp
+# dir is world-writable with the sticky bit, so every name under it is a name another
+# account can get to first: a directory it owns, a symlink aimed at a file of ours, a
+# symlink aimed at a file of theirs. This hook runs on every tool call and must not
+# become the lever that writes through any of them. So:
+#
+#   1. `scratchpad_dir` FIRST, when the payload carries one — the session's own private
+#      directory, which is what `wf-task-tag`'s `tag_path` already uses. MEASURED
+#      2026-10-12: a `PostToolUse` payload on 2.1.296 does NOT carry that key (the keys
+#      are agent_id, agent_type, cwd, duration_ms, effort, hook_event_name,
+#      permission_mode, prompt_id, session_id, tool_input, tool_name, tool_response,
+#      tool_use_id, transcript_path). It is preferred anyway because other events do
+#      carry it and because a host that starts sending it should be used, not ignored.
+#   2. Otherwise the temp dir, and every directory level is VERIFIED rather than trusted:
+#      not a symlink, a real directory, owned by this uid, and not group- or
+#      other-writable. Verified by `lstat` on the handle we are about to use.
+#   3. Any refusal returns "" and the caller counts from the transcript with no state at
+#      all. It never raises and never falls back to a path it could not verify.
+#
+# THE NAME IS FIXED RATHER THAN SALTED WITH THE UID, and that is a deliberate trade. A
+# hostile local account can squat `<tmp>/wf-turn-budget` and keep the check refusing
+# forever — a denial of service against the counter, which degrades to the transcript-only
+# path and still produces the right boundary at a little more cost per call. The
+# alternative, a uid in the name, is a path no fixture can spell, and this project does not
+# ship an untested security control. The attack this refuses is the one that matters:
+# writing through somebody else's link.
+STATE_MODE = 0o700
+
+
+def _safe_dir(path):
+    """Create or accept `path` as a private directory of ours. True when it is one."""
+    import stat as _stat
+    try:
+        os.mkdir(path, STATE_MODE)
+    except OSError:
+        pass                                    # already there, or cannot be made
+    try:
+        # `lstat`, NEVER `stat`: the question is what this NAME is, not what it points at.
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not _stat.S_ISDIR(st.st_mode):           # a symlink fails here, as does a file
+        return False
+    if st.st_mode & 0o022:                      # group- or other-writable
+        return False
+    getuid = getattr(os, "getuid", None)
+    return getuid is None or st.st_uid == getuid()
+
+
+def state_dir(payload, session_id, agent_id):
+    """The verified counter directory for this agent, or "" when none can be had."""
+    scratch = payload.get("scratchpad_dir")
+    if isinstance(scratch, str) and scratch and os.path.isdir(scratch):
+        base = os.path.join(scratch, "wf-turn-budget")
+    else:
+        import tempfile
+        base = os.path.join(tempfile.gettempdir(), "wf-turn-budget")
+    path = base
+    if not _safe_dir(path):
+        return ""
+    for part in (session_id, agent_id):
+        path = os.path.join(path, part)
+        if not _safe_dir(path):
+            return ""
+    return path
+
+
+def _open_nofollow(path, flags, mode=0o600):
+    """`os.open` with `O_NOFOLLOW` added, so a planted symlink at `path` is refused.
+
+    The flag is absent on some platforms; `getattr` keeps this importable there, and on
+    such a platform the directory ownership check above is the control that remains.
+    """
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+
+
+# WHAT THE COUNTER HOLDS, DECLARED ONCE AND IN ORDER. The reader, the writer and
+# `wf-widen`'s own read of the same file all key on this set, so a key added here reaches
+# every one of them — where three literal lists would have left the newest key written by
+# one and read by none. A KEY THAT ARRIVES ON STATE THAT NEVER HELD IT READS AS 0, which
+# is the honest answer and the compatible one: `writes` was added on 2026-10-13 and
+# `round`/`round_start` the day after, and a counter written before either says nothing was
+# counted, so nothing is claimed and the first write after the upgrade stores the real
+# number. For `round_start` that zero IS round 1, which is the behaviour that shipped.
+STATE_KEYS = ("off", "turns", "calls", "writes", "round", "round_start")
+
+
+def read_state(path):
+    """The stored counters, as a dict of `STATE_KEYS` — zeros for anything unreadable.
+    Unparsable state is DISCARDED.
+
+    The transcript is the source of truth and this file is a cache, so throwing it away
+    costs one full re-read and never a wrong answer. A hook that raised on scratch
+    somebody else can write would print a traceback on every tool call afterwards.
+
+    `O_NOFOLLOW`, so a symlink planted at `count.json` is refused rather than read
+    through — the read would otherwise be an arbitrary-file read aimed by whoever got to
+    the name first.
+    """
+    zero = dict.fromkeys(STATE_KEYS, 0)
+    try:
+        fd = _open_nofollow(os.path.join(path, "count.json"), os.O_RDONLY)
+    except OSError:
+        return zero
+    try:
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return zero
+    return dict((k, counted(d, k)) for k in STATE_KEYS)
+
+
+def write_state(path, state):
+    """Replace the counter atomically, and never through a link.
+
+    THE TEMPORARY NAME IS CREATED `O_CREAT | O_EXCL | O_NOFOLLOW`, so it cannot be a
+    symlink somebody planted and cannot clobber a file that is already there. `os.replace`
+    then renames over `count.json`: rename acts on the NAME, so a symlink sitting at that
+    name is replaced rather than written through. Those two together are why no file
+    outside this directory can be reached by writing here.
+
+    EXACTLY `STATE_KEYS` ARE WRITTEN, validated on the way out as well as on the way in.
+    The file is read by two hooks and by anybody's `cat`; a key that only one release ever
+    wrote is a key the other reads as 0 and cannot tell from absent.
+    """
+    tmp = os.path.join(path, "count.json.%d" % os.getpid())
+    try:
+        fd = _open_nofollow(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(dict((k, counted(state, k)) for k in STATE_KEYS), fh)
+        os.replace(tmp, os.path.join(path, "count.json"))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def claim(path, marker):
+    """True for the ONE caller that creates `marker`. False for every later one.
+
+    `O_CREAT | O_EXCL` RATHER THAN A FLAG IN THE COUNTER, and the difference is a real
+    race: parallel tool calls inside one turn fire this hook concurrently, and two
+    processes doing read-modify-write on one JSON file can both see the flag unset and
+    both inject. Creating a file is atomic, so exactly one of them speaks. `O_NOFOLLOW`
+    for the same reason the writer has it — a planted link at this name must be refused,
+    not followed, and a refusal here reads as "already claimed", which is the silent
+    direction.
+    """
+    try:
+        fd = _open_nofollow(os.path.join(path, marker),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def emit(text):
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse", "additionalContext": text}}) + "\n")
+
+
+# ── the hand-off mark on the issue ledger (K8) ───────────────────────────────
+# THE CUT AGENT'S WORK HAS TO BE FINISHED, NOT MERELY RECORDED. The user, 2026-10-12:
+# *"the agents are reaching their turn limits with the task uncompleted … we're waiting on
+# work that's never gonna get completed."* The injection above makes the cut READABLE; it
+# does not make the session continue the agent. So at the final threshold this hook marks
+# the agent `handoff` on its issue, and `wf-widen`'s main `Stop` reads that mark and names
+# the one action: resume THIS agent with `SendMessage`. MEASURED the same day: resuming a
+# cut coder with `SendMessage` kept its whole context and gave it a fresh turn allowance.
+#
+# WHY THE HOOK WRITES THE MARK AND NOT `SubagentStop`. This hook knows the `agent_id` and
+# the count at the moment the budget runs out. Whether `SubagentStop` fires at all when the
+# harness cuts a run at `maxTurns` is UNMEASURED on this host, and a mark that depends on an
+# unmeasured event is the silence this whole line of work exists to remove.
+#
+# WHY THE IMPORT IS IN HERE AND NOT AT THE TOP OF THE FILE. Loading `wf-task-tag` costs a
+# MEASURED +35 ms at best and +115 ms under load, and this file is a `PostToolUse` hook on
+# every tool call of every session — the reason stated above `BARE_NAME_RX` for not
+# importing it to borrow a validator. This path is reached ONCE PER ROUND per capped agent,
+# a handful of times in a whole session, so the cost lands where the run is ending anyway.
+# The alternative is a second writer of the ledger, which the order forbids and which would
+# be the copy that drifts.
+def _task_tag():
+    """`wf-task-tag` as a module, loaded from beside this file.
+
+    ONE LOADER FOR THE THREE CALLERS — the two ledger writers and the spawn guard's
+    reader — because a second copy of these six lines is a second idea of where the
+    sibling is and of whether bytecode may be written beside it.
+    """
+    import importlib.machinery
+    import importlib.util
+    # NEVER WRITE BYTECODE: a `__pycache__/` beside a shipped script is an undeclared
+    # shipped file, which `bin/check` fails on. `wf-widen`'s `_sibling` carries the
+    # same line for the same reason.
+    sys.dont_write_bytecode = True
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wf-task-tag")
+    loader = importlib.machinery.SourceFileLoader("wf_task_tag", path)
+    mod = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def _ledger_write(payload, call):
+    """Run one of `wf-task-tag`'s ledger writers and save when it recorded something.
+
+    `call(mod, led)` returns the issue id it landed on, or None for "nothing to record" —
+    and None means NOT SAVED, so the ordinary tool call of an already-`running` agent
+    rewrites no file.
+
+    Returns that issue id, or None — including when this project has no ledger, which is
+    every project that has not run a turn with an issue in it. NEVER RAISES: the boundary
+    injection is the part the run cannot do without, and a traceback here would print in
+    front of the model instead.
+    """
+    try:
+        mod = _task_tag()
+        led = mod.load_ledger(payload)
+        issue = call(mod, led)
+        if issue:
+            mod.save_ledger(payload, led)
+        return issue
+    except Exception:
+        return None
+
+
+def _ledger_read(payload, call):
+    """Run one of `wf-task-tag`'s ledger READERS. Its answer, or None.
+
+    NOTHING IS SAVED HERE and that is the whole difference from `_ledger_write`: the
+    spawn guard runs on a `PreToolUse` in the MAIN session, where this hook has never
+    written a byte, and a guard that rewrites the ledger it is only consulting would put
+    this hook's name on every issue file in every project that has one.
+    """
+    try:
+        mod = _task_tag()
+        return call(mod, mod.load_ledger(payload))
+    except Exception:
+        return None
+
+
+def mark_handoff(payload, writes):
+    """Mark this agent `handoff` on its issue, with the work it produced this round.
+
+    `writes` is its cumulative `WRITE_TOOLS` count; `agent_handoff` compares it against
+    the number the previous mark stored and calls the agent stalled only when nothing
+    moved on either measure.
+    """
+    return _ledger_write(payload, lambda mod, led: mod.agent_handoff(payload, led, writes))
+
+
+# ── and the other end of it: a resumed agent is working again ────────────────
+# A `SendMessage` RESUME FIRES NO `SubagentStart`, so nothing else in this distribution
+# ever sees it. Without this, a resumed agent's entry sits at `handoff` for the whole
+# second round and the main `Stop` of the turn in the middle of it asks the session to
+# resume an agent that is already resumed. This hook is the only thing that observes the
+# cut agent making a tool call again, so it is the one that can say so.
+#
+# ONCE PER ROUND, THROUGH THE SAME CLAIM FILE MECHANISM the injections use, and gated on a
+# final marker already being claimed — so the cost on every ordinary capped agent is ONE
+# `os.path.exists`, and the ledger is loaded only on the first call after a cut.
+RESUME_MARK = "resumed-after-"
+
+
+def last_claim(path, marker, rounds):
+    """The newest round-keyed `marker` claimed under `path`, or "" when none was.
+
+    NEWEST FIRST, because the question is "has this agent been cut, and by which claim" —
+    and the claim that decides is the last one, so each cut gets exactly one resume flip
+    keyed to it. `rounds` bounds the walk, and the caller passes the round BEFORE the one
+    it is in: a cut claimed by the current allowance is not a cut this allowance can be
+    the resume of. That bound makes it ONE `os.path.exists` for an agent that was never
+    cut — almost every agent, on every call — and no walk at all inside a first allowance,
+    where `rounds` is -1 and the range is empty.
+
+    KEYED TO THE CUT RATHER THAN TO THE ROUND, and that is measured. In session `68b82f98`
+    a `maxTurns: 10` IC was cut at turn 8 and resumed at turn 9, and the cap-multiple
+    arithmetic that scheduled the rounds read the same round for both — one round by that
+    arithmetic, two allowances in fact. A resume claim keyed by round number would
+    therefore have been spent by the cut itself for small caps. The marker that the cut
+    actually claimed is the one thing that cannot disagree with how many times this agent
+    has been told to hand off.
+    """
+    for k in range(rounds, -1, -1):
+        name = keyed(marker, k)
+        if os.path.exists(os.path.join(path, name)):
+            return name
+    return ""
+
+
+def mark_running(payload):
+    """Put this agent back to `running` on its issue after a resume."""
+    return _ledger_write(payload, lambda mod, led: mod.agent_resumed(payload, led))
+
+
+# ── the wrong action, refused where it is taken (K8, 2026-10-13) ─────────────
+# A CUT AGENT IS RESUMED, NOT REPLACED, AND UNTIL NOW NOTHING STOPPED THE REPLACEMENT.
+# MEASURED in trial e2e3, session `bb8a3e53`: a cap-10 filer was cut, and in the SAME main
+# turn the session spawned a second filer with the `Agent` tool and then a third. The two
+# cut agents stayed `handoff` in the ledger for the rest of the session. The kickback that
+# names the resume is on the main `Stop`, and a session that never stops between
+# dispatches never reaches it — so the correction arrived after all three runs were over.
+#
+# `PreToolUse` IS THE EVENT, BECAUSE IT IS THE ONLY ONE THAT CAN SAY NO. Every other hook
+# in this mechanism reports after the fact. A deny here reaches the model as the reason it
+# could not do the thing, in the turn it tried, with the agent_id it should have messaged
+# instead — which is the one piece of information a `Stop` three dispatches later cannot
+# deliver in time.
+#
+# THE MAIN SESSION ONLY. `agent_id` is absent on a main-thread payload and present inside
+# a subagent (MEASURED 2026-10-12, platform.md fact 22a), and it is the manager that holds
+# the resume: an employee spawning a helper of its own is not the measured defect and is
+# not refused here.
+#
+# AND IT NEVER WEDGES A SESSION. Four separate things make the deny lift by itself: the
+# issue closing, `agent_resumed` retiring the mark at the resumed agent's next tool call,
+# the mark ageing out of `held_by`'s window, and a spawn of any OTHER role, which is never
+# touched. A project with no ledger reads `[]` and is never guarded at all.
+#
+# `{action}` IS NOT SPELLED OUT HERE. It is `wf-task-tag`'s `resume_action`, which
+# `wf-widen` reads for the same sentence at the main `Stop` — one mechanism saying one
+# thing on two events. Each file used to carry its own wording and the two had already
+# drifted by the time they were made one definition (2026-10-13).
+DENY_TEXT = """A cut agent of this role is still holding this work, so a fresh one would start it over.
+
+{who} ({atype}) hit its turn cap in this session and is marked `handoff` on this
+session's issue ledger — measured 2026-10-12: a coder cut at 80 tool calls was resumed
+rather than replaced, and finished at 129.
+
+{action}
+
+`HANDOFF` from an employee is a request to resume THAT agent. It is never a brief for a
+replacement. Spawn a fresh {atype} only after the resumed agent reports its context
+exhausted, and say so to the user before you do."""
+
+
+def guard_spawn(payload):
+    """Refuse an `Agent` spawn of a role this session has a cut agent of. Always 0.
+
+    SILENT FOR EVERYTHING ELSE, and each exit is one of the conditions the order named:
+    another tool, a spawn from inside a subagent, a `subagent_type` that is not a bare
+    name, a project with no ledger, a role nobody was cut on, and a mark `held_by` reads
+    as stale.
+    """
+    # TRUTHINESS, NOT `is not None`: the main thread is the payload with NO usable
+    # `agent_id`, and an empty string is no more an agent than an absent key is.
+    if payload.get("tool_name") != "Agent" or payload.get("agent_id"):
+        return 0
+    tool_input = payload.get("tool_input")
+    want = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+    if not bare(want):
+        return 0
+    # EVERY ID IS VALIDATED BEFORE IT BECOMES TEXT IN FRONT OF THE MODEL. These come off
+    # a JSON file in the repository, which a person or another tool can edit, and this
+    # hook's output is a `permissionDecisionReason` — model context, not a log line. An
+    # unvalidated string from that file would be arbitrary text injected into the turn.
+    # `bare` is the same refusal `agent_type` takes two lines up.
+    #
+    # THE MODULE COMES BACK WITH THE IDS, one load for both halves: the ledger answers who
+    # is held, and the same module owns the sentence this deny ends on (`resume_action`).
+    # Asking for it in a second `_ledger_read` would re-execute the sibling and re-read the
+    # ledger to format a string.
+    #
+    # THE `bare` FILTER STAYS HERE EVEN THOUGH `resume_action` NOW VALIDATES TOO, because
+    # the two refusals answer different questions. This one is CONTROL FLOW: a held agent
+    # nobody can name leaves `held` empty, and an empty `held` allows the spawn rather than
+    # denying it in terms the model cannot act on (`spawn-guard-a-planted-agent-id-is-
+    # never-quoted`). The one in `name_agents` only decides what is quoted.
+    got = _ledger_read(payload, lambda mod, led: (
+        mod, [a for a in (mod.held_by(led, want) or []) if bare(a)]))
+    tt, held = got if got else (None, [])
+    if not held:
+        return 0
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": DENY_TEXT.format(
+            who=", ".join(held), atype=want,
+            action=tt.resume_action(held))}}) + "\n")
+    return 0
+
+
+# THE ASKS CHECKLIST, SHOWN TO THE USER WHEN THE MAIN SESSION WRITES IT (`wf-task-tag`'s
+# `checklist_display`, which holds the reason and the rules). IT RIDES THIS HOOK because this
+# hook already runs on every tool call: a registration of its own on `Write|Edit|Bash` would
+# start a second Python process on most calls of every session, and loading `wf-task-tag`
+# costs the +35 to +115 ms measured above `_task_tag`. Here a call that does not name the
+# checklist costs two string tests on fields already parsed, and only a call that names it
+# loads the sibling. `CHECKLIST_PREFIX` there is the literal restated below.
+CHECKLIST_PREFIX = "wf-asks."
+
+
+def checklist_shown(payload):
+    """Hand the session the checklist display for this main-thread call when there is one,
+    as `PostToolUse` `additionalContext` (`checklist_display` says why not `systemMessage`).
+    Checked in the 2.1.312 binary: its `PostToolUse` branch reads
+    `hookSpecificOutput.additionalContext` when `hookEventName` is `PostToolUse`. Always 0."""
+    ti = payload.get("tool_input")
+    if not isinstance(ti, dict) or not any(
+            isinstance(ti.get(k), str) and CHECKLIST_PREFIX in ti[k]
+            for k in ("file_path", "command")):
+        return 0
+    text = _task_tag().checklist_display(payload)
+    if text:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse", "additionalContext": text}}) + "\n")
+    return 0
+
+
+# THE USER'S WORDS BEFORE A PAGE IS PUBLISHED OR A QUESTION IS ASKED, on this same
+# `PreToolUse` row (`wf-task-tag.ask_words` holds the reason and the measurement). Context
+# only: it never denies, it reads and never writes the ledger, and it spawns nothing.
+ASK_WORDS_TOOLS = ("Artifact", "AskUserQuestion")
+
+
+def ask_words(payload):
+    """Hand the call the open issue's user words as `additionalContext`. Always 0."""
+    text = _ledger_read(payload, lambda mod, led: mod.ask_words(payload, led))
+    if text:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "additionalContext": text}}) + "\n")
+    return 0
+
+
+def main():
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+
+    # ── THE OTHER EVENT: a spawn about to replace an agent that should be resumed ──
+    # Tested first because the fast path below reads the ABSENCE of `agent_id` as "main
+    # thread, nothing to do", and the main thread is exactly where this guard runs.
+    if payload.get("hook_event_name") == "PreToolUse":
+        if payload.get("tool_name") in ASK_WORDS_TOOLS:
+            return ask_words(payload)
+        return guard_spawn(payload)
+
+    # ── THE FAST PATH: no file is touched in the main thread ─────────────────
+    # `agent_id` absent means the main thread (MEASURED 2026-10-12), where the only work is
+    # the checklist display, and a call that does not name the list touches no file there
+    # either (`checklist_shown`). `agent_type` absent
+    # with `agent_id` present means a `type: "agent"` hook's own agent, which has no
+    # handbook and no cap — also measured, and not predicted by the design.
+    agent_id = payload.get("agent_id")
+    agent_type = payload.get("agent_type")
+    if agent_id is None:
+        return checklist_shown(payload)
+    if not bare(agent_id) or not bare(agent_type):
+        return 0
+
+    root = payload.get("cwd")
+    if not isinstance(root, str) or not os.path.isdir(root):
+        root = os.getcwd()
+    cap = read_cap(root, agent_type)
+    if cap is None:
+        return 0
+
+    session_id = payload.get("session_id")
+    if not bare(session_id):
+        session_id = "no-session"
+    tpath = agent_transcript(payload, session_id, agent_id)
+    path = state_dir(payload, session_id, agent_id)
+
+    if path:
+        state = read_state(path)
+        # HAS THIS ROUND'S NOTICE ALREADY GONE OUT? `count_turns` needs the answer before
+        # it reads, because that is what licenses it to read a prompt row in the tail as
+        # the start of a new allowance. One `os.path.exists` on the ordinary call of an
+        # agent that has never been cut, which is almost every call.
+        pending = final_pending(path, state, cap)
+        state["calls"] += 1
+        tail = count_turns(tpath, state["off"], pending=pending)
+        if tail["turns"] is None:
+            # THE FALLBACK ERRS TOWARD AN EARLY HANDOFF. Calls >= turns always, so a call
+            # count crosses the boundary no later than the true turn count would. An early
+            # written hand-back costs one extra order; a silent cut-off costs the run.
+            state["turns"] = state["calls"]
+        else:
+            fold_tail(state, tail)
+        write_state(path, state)
+        spent = {}
+    else:
+        # NO DIRECTORY COULD BE VERIFIED, SO THERE IS NO STATE AND THE RUN STILL GETS ITS
+        # BOUNDARY. The count is taken from the whole transcript rather than a tail, and
+        # the once-only rule is answered by the transcript too: a delivered injection is
+        # recorded there as a `hook_additional_context` attachment (measured 2026-10-12),
+        # so what was already said can be read back. The rounds come off the same read,
+        # which is why `pending` defaults to False here: the whole run is in front of it,
+        # injections included, so it can see for itself which prompt row ended a round. No
+        # transcript AND no state leaves nothing to count, and a number nothing measured is
+        # not worth stopping a run on.
+        tail = count_turns(tpath, 0, (WARN_MARK, FINAL_MARK, JOB_MARK))
+        if tail["turns"] is None:
+            return 0
+        spent = tail["seen"]
+        state = {"turns": tail["turns"], "writes": tail["writes"],
+                 "round": tail["rounds"], "round_start": tail["round_start"]}
+    writes = state["writes"]
+    # THE ROUND, ANCHORED TO WHERE THE LAST ONE ENDED. One function answers it for this
+    # hook and for `wf-widen`'s record of the same stop, so the schedule and the line that
+    # reports it cannot drift apart again — which they had, and the cost was a resumed
+    # agent that reached its second cap in silence.
+    in_round, allowance, _start = turn_round(state, cap)
+    round_ = allowance - 1
+
+    def once(marker, mark, round_=0):
+        """True for the one call that gets to say this, ONCE PER ROUND.
+
+        A ROUND IS ONE TURN ALLOWANCE, AND A RESUMED AGENT IS ON ITS SECOND. The counter
+        reads one transcript that keeps growing across a `SendMessage` resume, so `turns`
+        never goes back to zero — and the marker file lives under the same session and
+        agent, so a round-blind claim is spent forever by the first cut. A resumed agent
+        would then hit its new cap with no notice at all, which is the defect this hook
+        exists for, one layer out. The marker is therefore keyed by round; round 0 keeps
+        today's name, so a claim written before this change is still read.
+        """
+        if path:
+            return claim(path, keyed(marker, round_))
+        return spent.get(mark, 0) <= round_
+
+    # BOTH DUE AT ONCE MEANS THE STRONGER ONE SPEAKS, and under `cap - 3` the final one is
+    # due FIRST for every cap below 15 (`maxTurns: 10` puts the final at 7 and the 80%
+    # warn at 8). That is handled rather than special-cased: the final branch is tested
+    # first and spends the warn unspoken, and the final text carries the whole instruction
+    # — both files, their shape, and the verdict — so an agent that only ever sees this one
+    # is told everything the warn would have told it. Emitting two paragraphs on one call
+    # would spend the budget it is trying to protect.
+    # BOTH THRESHOLDS ARE READ INSIDE THE ALLOWANCE, which is the whole of the fix: the
+    # turn compared against them is `turns - round_start`, so round 2 of a cap of 10 fires
+    # its final notice at the anchor plus 7 whatever the anchor is — turn 15 for a round
+    # that ended at 8, and turn 157 for one that ended on the nose at 80.
+    cut_now = False
+    if payload.get("tool_name") == HANDBACK_TOOL:
+        # THE RUN IS OVER, so nothing is said into it and nothing is claimed: a notice here
+        # is read by the NEXT run as its own (`HANDBACK_TOOL`), and a `handoff` mark here
+        # would hold the role against an agent that just delivered. The round this call
+        # ends is closed by the hand-back row itself, in `count_turns` — and by this claim
+        # when that row is already in the file this call read, since the read that consumed
+        # it stores no `pending` for the prompt row that comes after (`final_pending`).
+        if path:
+            claim(path, keyed(HANDBACK_MARK, round_))
+    elif in_round >= final_at(cap):
+        once("fired-warn", WARN_MARK, round_)      # spend the quieter one unspoken
+        if once("fired-final", FINAL_MARK, round_):
+            # THE MARK BEFORE THE TEXT. The injection is what the agent acts on, and the
+            # mark is what the session acts on; if only one of them can land, the one that
+            # survives a crash in the other is the one the user is waiting on.
+            cut_now = True
+            mark_handoff(payload, writes)
+            emit(FINAL_TEXT.format(turns=in_round, cap=cap, sections=BRIEF_SECTIONS))
+    elif in_round >= warn_at(cap) and once("fired-warn", WARN_MARK, round_):
+        emit(WARN_TEXT.format(turns=in_round, cap=cap, sections=BRIEF_SECTIONS))
+    # A JOB STARTED AFTER THE NOTICE, which the notice could not name (`JOB_TEXT`). Never on
+    # a call that already spoke, and never past the final threshold, whose branch above
+    # owns the call: one paragraph per call, and the final notice already says return now.
+    elif (in_round >= warn_at(cap) and launched_background(payload)
+          and once("fired-job", JOB_MARK, round_)):
+        emit(JOB_TEXT)
+    # AND THE OTHER END: THIS CALL IS A CUT AGENT WORKING AGAIN. Not on the call that just
+    # told it to resume, which would flip the mark it had this moment written. No state
+    # directory means no claim and no flip: the transcript records an injection but not a
+    # resume, so such an agent keeps its `handoff` mark until it delivers — one resume asked
+    # for twice, which is the recoverable direction against a hold that never ends.
+    #
+    # A LATER ROUND, NEVER A LATER CALL, AND THE EVIDENCE IS TRIAL e2e3. The notice fires
+    # at `cap - 3`, which leaves the agent THREE MORE TURNS in the same allowance — so a
+    # bound of `round_` found the cut this round had just claimed and read the agent's own
+    # next tool call as a resume. Filer `a26b1c41eecfb3119` was flipped back to `running`
+    # that way after each of its two notices, the harness cut it for real at the end, and
+    # `agent_returned` recorded `returned` on an agent that was holding work. A resume is
+    # a NEW ALLOWANCE: `turn_round` only reports one after `count_turns` saw the prompt row
+    # that opened it, so the cut being answered has to belong to an EARLIER round than the
+    # one this call is in. `round_ - 1` is that test, and at `round_ == 0` the walk is
+    # empty and no agent still inside its first allowance is ever called resumed.
+    if path and not cut_now:
+        cut = last_claim(path, "fired-final", round_ - 1)
+        if cut and claim(path, RESUME_MARK + cut):
+            mark_running(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    # NEVER RAISES. Anything unforeseen is silence, because the alternative is a
+    # traceback in front of the model on every tool call for the rest of the session.
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)

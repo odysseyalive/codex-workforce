@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Run one upstream sense hook (wf-task-tag, wf-turn-ledger, wf-widen) under the Codex
+patches. Reads the already-normalised payload on stdin and prints the hook's own output.
+
+Called by cwf-hook, one process per step, so no two hooks share stdin, stdout or module
+caches. Not a hook entry point itself."""
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import cwf_codex  # noqa: E402
+
+ALLOWED = {"wf-task-tag", "wf-turn-ledger", "wf-widen"}
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ALLOWED:
+        print(f"usage: cwf-step {{{'|'.join(sorted(ALLOWED))}}}", file=sys.stderr)
+        return 2
+    mod = cwf_codex.load_upstream(sys.argv[1])
+    return mod.main() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
