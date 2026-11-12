@@ -7,9 +7,8 @@ it is not injected into subagents or Stop-feedback continuations.
 ## Where the project stands
 
 - Repo: `/home/francis/lab/codex-workforce`
-- HEAD: `d3238f9` — "Resume a new Codex session from tracked RESUME.md"; its parent
-  `cfa640b` cut Crush compatibility. The tracking commit for this documentation correction
-  follows and becomes the exact HEAD.
+- HEAD: `f8033e4` — "Update resume handoff to the committed HEAD". It follows `d3238f9`,
+  which added the resume mechanism, and `cfa640b`, which cut Crush compatibility.
 - VERSION: `0.1.1`
 - Tests: `python3 -m unittest discover -s tests -v` — 33 tests, OK.
 - Supported host: **Codex only**. Crush compatibility was cut by the user on 2026-11-11.
