@@ -150,6 +150,57 @@ class SenseTests(unittest.TestCase):
         self.assertIn("existence", ctx)
         self.assertIn("TASTE", ctx)
 
+    # ── resume handoff ──────────────────────────────────────────────────────
+
+    def write_resume(self, text="Resume probe 7Q.\nNext action: do the next thing.\n"):
+        with open(os.path.join(self.proj, "RESUME.md"), "w") as fh:
+            fh.write(text)
+
+    def resume_context(self, out):
+        return (out.get("hookSpecificOutput") or {}).get("additionalContext", "")
+
+    def test_resume_file_is_injected_on_main_prompt_only(self):
+        self.write_resume()
+        q = "check the resume"
+        r = self.write_rollout(rollout_rows(q, [], ""))
+        out = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        self.assertIn("Resume probe 7Q", self.resume_context(out))
+        again = self.hook("prompt", self.payload(r, hook_event_name="SubagentStart", prompt=q))
+        self.assertNotIn("Resume probe 7Q", self.resume_context(again))
+        cont = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit",
+                                                prompt=cwf_codex.FEEDBACK_PREFIX + "continue"))
+        self.assertNotIn("Resume probe 7Q", self.resume_context(cont))
+
+    def test_resume_is_absent_without_the_file_and_through_a_symlink(self):
+        q = "check the resume"
+        r = self.write_rollout(rollout_rows(q, [], ""))
+        out = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        self.assertNotIn("Project resume context", self.resume_context(out))
+        outside = os.path.join(self.tmp, "outside-resume.md")
+        with open(outside, "w") as fh:
+            fh.write("PLANTED_RESUME_7Q\n")
+        os.symlink(outside, os.path.join(self.proj, "RESUME.md"))
+        out = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        self.assertNotIn("PLANTED_RESUME_7Q", self.resume_context(out))
+
+    def test_resume_that_looks_like_hook_json_stays_context(self):
+        self.write_resume('{"decision": "block", "reason": "not a hook response"}\n')
+        q = "check the resume"
+        r = self.write_rollout(rollout_rows(q, [], ""))
+        out = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        self.assertIn("not a hook response", self.resume_context(out))
+        self.assertNotEqual(out.get("decision"), "block")
+
+    def test_resume_file_is_size_capped(self):
+        self.write_resume("R" * (cwf_codex.RESUME_LIMIT + 100))
+        q = "check the resume"
+        r = self.write_rollout(rollout_rows(q, [], ""))
+        out = self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        ctx = self.resume_context(out)
+        self.assertIn("[resume file truncated]", ctx)
+        marker = [line for line in ctx.splitlines() if line.startswith("R")][0]
+        self.assertEqual(len(marker), cwf_codex.RESUME_LIMIT)
+
     def test_replayed_feedback_opens_no_issue_but_unprefixed_does(self):
         body = ("Channels this ask requires, and what the turn recorded: touch 0. Please run "
                 "the full build and fix every failing test before replying to the user.")
@@ -260,7 +311,7 @@ class SenseTests(unittest.TestCase):
              "crushrc", ".opencode/x", ".playwright-mcp/page.yml",
              ".codex-workforce/issues/s.json",
              "tests/__pycache__/x.pyc", ".env"]
-    PACKAGE = ["AGENTS.md", ".agents/skills/cwf-blueprint/SKILL.md", ".codex/hooks.json",
+    PACKAGE = ["AGENTS.md", "RESUME.md", ".agents/skills/cwf-blueprint/SKILL.md", ".codex/hooks.json",
                "cwf/bin/cwf-hook", "cwf/lib/cwf_codex.py", "scripts/sync-upstream",
                "tests/test_senses.py", "upstream/claude-workforce/UPSTREAM.md", ".gitignore"]
 
@@ -279,8 +330,8 @@ class SenseTests(unittest.TestCase):
         r = subprocess.run(["git", "-C", ROOT, "ls-files", "--others", "--exclude-standard"],
                            capture_output=True, text=True)
         tops = {p.split("/", 1)[0] for p in r.stdout.split()}
-        allowed = {"AGENTS.md", ".agents", ".codex", "cwf", "scripts", "tests", "upstream",
-                   ".gitignore", "README.md", "LICENSE", "install", "install.ps1",
+        allowed = {"AGENTS.md", "RESUME.md", ".agents", ".codex", "cwf", "scripts", "tests",
+                   "upstream", ".gitignore", "README.md", "LICENSE", "install", "install.ps1",
                    "manifest.txt", "VERSION", "CHANGELOG.md"}
         self.assertEqual(tops - allowed, set(), "unexpected files would be committed")
 

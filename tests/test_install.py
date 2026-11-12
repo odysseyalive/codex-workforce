@@ -80,11 +80,13 @@ class InstallerTests(unittest.TestCase):
     def test_user_install_update_and_uninstall(self):
         r = self.run_install("--user")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("installed 0.1.0 (user scope)", r.stdout)
+        self.assertIn("installed 0.1.1 (user scope)", r.stdout)
         inst = os.path.join(self.codex, "codex-workforce")
         for p in manifest():
             if not p.startswith(".agents/"):
                 self.assertTrue(os.path.isfile(os.path.join(inst, p)), p)
+        self.assertTrue(os.path.isfile(os.path.join(inst, "RESUME.md")),
+                        "the resume handoff must ship with the install")
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".agents/skills/cwf-blueprint/SKILL.md")))
         hooks = self.hooks(self.codex)
         self.assertEqual(hooks["SessionStart"][0]["hooks"][0], self.other)
@@ -94,7 +96,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, ".claude")))
 
         again = self.run_install("--user")
-        self.assertIn("reinstalled 0.1.0", again.stdout)
+        self.assertIn("reinstalled 0.1.1", again.stdout)
         self.assertEqual(len(self.cwf_handlers(self.hooks(self.codex))), 4, "no duplicate hooks")
 
         mine = os.path.join(self.home, ".agents/skills/cwf-mine")
@@ -137,7 +139,7 @@ class InstallerTests(unittest.TestCase):
             fh.write("9.9.9\n")
         r = self.run_install("--user")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("downgrade 9.9.9 to 0.1.0", r.stderr)
+        self.assertIn("downgrade 9.9.9 to 0.1.1", r.stderr)
         self.assertEqual(self.run_install("--user", "--force").returncode, 0)
 
     def test_project_install(self):

@@ -3,11 +3,13 @@
 The version lives in `VERSION`. Bump it in the same change that alters anything listed in
 `manifest.txt`, and add an entry here.
 
-## Unreleased (2026-11-11)
+## 0.1.1 (2026-11-11)
 
 - Crush compatibility was cut by the user. Codex is the only supported host; the Crush
   discovery remains evidence, not a product target. Crush probe files stay ignored so they
   cannot be committed by accident.
+- `RESUME.md` is a tracked handoff file. The existing trusted prompt hook injects it once on
+  the first main-session prompt, and never into subagents or Stop-feedback continuations.
 
 ## 0.1.0 (2026-11-11)
 

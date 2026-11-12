@@ -38,10 +38,25 @@ def prompt_event(raw):
             out = {}
         out["systemMessage"] = _join(out.get("systemMessage"), f"cwf: {problem}")
     if out is not None:
+        resume = payload.get("cwf_resume_context") or ""
+        if resume:
+            hook = out.setdefault("hookSpecificOutput", {})
+            if isinstance(hook, dict):
+                hook["hookEventName"] = "UserPromptSubmit"
+                hook["additionalContext"] = _join(hook.get("additionalContext"), resume)
         emit(out)
     elif text:
         # UserPromptSubmit and SubagentStart accept plain text as extra developer context.
-        print(text)
+        # A resume file is DATA, not hook JSON: never print its raw text as the response.
+        resume = payload.get("cwf_resume_context") or ""
+        if resume and raw.get("hook_event_name") == "UserPromptSubmit":
+            emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                        "additionalContext": _join(text, resume)}})
+        else:
+            print(text)
+    elif payload.get("cwf_resume_context") and raw.get("hook_event_name") == "UserPromptSubmit":
+        emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                    "additionalContext": payload["cwf_resume_context"]}})
     return 0
 
 

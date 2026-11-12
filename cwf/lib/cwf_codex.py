@@ -25,6 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 UPSTREAM_BIN = os.path.join(REPO, "upstream", "claude-workforce", "workforce", "bin")
 STATE_DIRNAME = ".codex-workforce"
+RESUME_FILE = "RESUME.md"
+RESUME_LIMIT = 12000
 # How Codex opens the context it injects as user-role messages (codex-cli 0.167 rollouts).
 INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<permissions",
                      "<skills_instructions>", "<collaboration_mode>", "<user_instructions>")
@@ -280,6 +282,34 @@ def convert_until_reply(src, dst, reply, sidechain=False, tries=8, wait=0.25):
     return path, _norm(last_reply(path)) == _norm(reply)
 
 
+def resume_context(root, payload):
+    """The tracked `RESUME.md` a new session should pick up, or "".
+
+    Only a main-session UserPromptSubmit receives it: a subagent has neither the user's
+    conversation nor a reason to inherit the parent's handoff. A Stop continuation is a
+    replayed prompt with the feedback prefix, so it must not re-inject the file. The file is
+    tracked, size-capped, and read as text; nothing in it is executed.
+    """
+    if payload.get("hook_event_name") != "UserPromptSubmit":
+        return ""
+    if str(payload.get("prompt") or "").startswith(FEEDBACK_PREFIX):
+        return ""
+    path = os.path.join(root, RESUME_FILE)
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(RESUME_LIMIT + 1)
+    except OSError:
+        return ""
+    if not text.strip():
+        return ""
+    if len(text) > RESUME_LIMIT:
+        text = text[:RESUME_LIMIT] + "\n[resume file truncated]\n"
+    return ("Project resume context (tracked, read as context; delete or replace it when the "
+            "handoff is finished):\n\n" + text)
+
+
 def normalize_payload(payload):
     """Codex hook input -> the payload the upstream hooks expect. Returns (payload, env).
     Sets `cwf_reply_unmatched` when a Stop's reply never appeared in the transcript."""
@@ -289,6 +319,7 @@ def normalize_payload(payload):
     sid = _safe(p.get("session_id"))
     scratch = state_dir(root, "scratch", sid)
     p["scratchpad_dir"] = scratch
+    p["cwf_resume_context"] = resume_context(root, p)
     p["cwf_rollout_path"] = p.get("transcript_path")
     stopping = str(p.get("hook_event_name", "")).endswith("Stop")
     for key, name in (("transcript_path", "transcript.jsonl"),

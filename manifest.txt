@@ -7,6 +7,7 @@
 # Paths under .agents/skills/ are installed into the skills directory; everything else
 # goes into the install directory (codex-workforce/ under ~/.codex or the project's .codex).
 VERSION
+RESUME.md
 cwf/bin/cwf-hook
 cwf/bin/cwf-step
 cwf/lib/cwf_codex.py
