@@ -7,10 +7,12 @@ it is not injected into subagents or Stop-feedback continuations.
 ## Where the project stands
 
 - Repo: `/home/francis/lab/codex-workforce`
-- HEAD: `f8033e4` — "Update resume handoff to the committed HEAD". It follows `d3238f9`,
-  which added the resume mechanism, and `cfa640b`, which cut Crush compatibility.
+- HEAD: `2f7c55f` — "Record that the Codex hooks have fired live". The resume mechanism is
+  `d3238f9`, the Crush cut is `cfa640b`, and this file was last corrected at `2f7c55f`.
 - VERSION: `0.1.1`
 - Tests: `python3 -m unittest discover -s tests -v` — 33 tests, OK.
+- Live hook status: prompt, SubagentStart, Stop and SubagentStop have all fired in this
+  repository. The resume handoff is injected by the prompt hook; no new hook event was added.
 - Supported host: **Codex only**. Crush compatibility was cut by the user on 2026-11-11.
   The Crush probing stays as historical evidence, not a product target.
 
