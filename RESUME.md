@@ -7,10 +7,11 @@ it is not injected into subagents or Stop-feedback continuations.
 ## Where the project stands
 
 - Repo: `/home/francis/lab/codex-workforce`
-- Base commit: `cfa640b` — "Cut Crush compatibility; Codex is the only supported host"
-  The resume mechanism is committed after that commit; use `git log -1` for the exact HEAD.
+- HEAD: `d3238f9` — "Resume a new Codex session from tracked RESUME.md"; its parent
+  `cfa640b` cut Crush compatibility. The tracking commit for this documentation correction
+  follows and becomes the exact HEAD.
 - VERSION: `0.1.1`
-- Tests: `python3 -m unittest discover -s tests -v` — 32 tests, OK.
+- Tests: `python3 -m unittest discover -s tests -v` — 33 tests, OK.
 - Supported host: **Codex only**. Crush compatibility was cut by the user on 2026-11-11.
   The Crush probing stays as historical evidence, not a product target.
 
@@ -19,8 +20,8 @@ it is not injected into subagents or Stop-feedback continuations.
 - `cfa640b`: Codex is the only supported host; Crush is historical discovery evidence.
   `CHANGELOG.md` records the cut. `scripts/build-skills` describes a Codex skill generator.
   `.gitignore` and `tests/test_senses.py` ignore/cover `.crushrc` and `crushrc`.
-- The follow-up change adds the tracked `RESUME.md` and injects it through the existing trusted
-  prompt hook. It does not add a new hook event, so no re-trust is needed for this change.
+- `d3238f9` adds the tracked `RESUME.md` and injects it through the existing trusted prompt
+  hook. It does not add a new hook event, so no re-trust is needed for this change.
 
 Decision record: the user chose to **keep the existing shared link** and its versions 1–4,
 rather than delete the artifact and republish at a new URL. Version 5 is the current page and
