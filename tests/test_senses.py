@@ -8,7 +8,11 @@ Each test works in a fresh git repository in a temp directory. Run them from a n
 shell, not from inside a Codex sandbox: on this machine Codex's sandbox gives /tmp its own
 view, and files written there do not persist.
 """
+import contextlib
 import glob
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 import shutil
@@ -109,6 +113,109 @@ class SenseTests(unittest.TestCase):
         result = [r for r in rows if r.get("toolUseResult")][0]
         self.assertEqual(result["toolUseResult"]["stdout"], "a.txt\n")
 
+    def test_tool_map_covers_every_recorded_codex_tool(self):
+        names = {"exec_command", "shell", "local_shell", "apply_patch", "web_search",
+                 "web_search_call", "web_fetch", "spawn_agent", "wait_agent", "close_agent",
+                 "write_stdin", "view_image"}
+        self.assertEqual(names - set(cwf_codex.TOOL_MAP), set())
+        self.assertEqual(cwf_codex.TOOL_MAP["web_fetch"], "WebFetch")
+        _, rows = self.convert(rollout_rows(
+            "who wrote the incident report?",
+            [("web_fetch", {"url": "https://example.test/x"}, "outside evidence")],
+            "the report says so"))
+        tool = [b for r in rows if r["type"] == "assistant"
+                for b in r["message"]["content"] if b["type"] == "tool_use"][0]
+        self.assertEqual(tool["name"], "WebFetch")
+
+    def test_widen_patches_never_write_under_claude(self):
+        W = cwf_codex.load_upstream("wf-widen")
+        TT = cwf_codex.load_upstream("wf-task-tag")
+        self.assertEqual(W.PERF_STORE_PARTS, (".codex-workforce", "personnel"))
+        self.assertEqual(W.WORK_DIRS, (".codex-workforce", "work"))
+        self.assertNotIn("AskUserQuestion", TT.CHOOSER_RULE)
+        self.assertNotIn("shutdown_request", TT.CLEANUP_RULE)
+        self.assertNotIn("AskUserQuestion", TT.USER_WORDS + TT.CHOOSER_RULE + TT.CLEANUP_RULE)
+        self.assertIn("close_agent", TT.CLEANUP_RULE)
+        self.assertIn("plain-text question", TT.CHOOSER_RULE)
+        # The paths consumers, not just the constants: a patched constant that a helper
+        # ignores is the false-clean F01 was.
+        self.assertEqual(W.perf_store(self.proj), os.path.join(
+            self.proj, ".codex-workforce", "personnel"))
+        os.makedirs(os.path.join(self.proj, ".codex-workforce", "work", "run", "worker"), exist_ok=True)
+        with open(os.path.join(self.proj, ".codex-workforce", "work", "run", "worker",
+                               "HANDOFF.md"), "w") as fh:
+            fh.write("1. The order\n2. The next section\n")
+        self.assertIn("The order", W.handoff_brief(self.proj, "worker"))
+        self.assertFalse(os.path.exists(os.path.join(self.proj, ".claude")))
+
+    def test_cap_hit_perf_lands_under_codex_workforce(self):
+        """F19/F01: the producer path, not only the constant. Force `at_cap` to report a
+        cut and a missing OUTPUT.md, then assert the PERF file lands in the Codex state
+        directory and no `.claude/` appears."""
+        W = cwf_codex.load_upstream("wf-widen")
+        payload = {"cwd": self.proj, "agent_type": "worker", "hook_event_name": "SubagentStop",
+                   "session_id": "s1", "agent_id": "a1",
+                   "agent_transcript_path": os.path.join(self.tmp, "agent.jsonl")}
+        order = ("Write your report to .codex-workforce/work/run/worker/OUTPUT.md")
+        os.makedirs(os.path.join(self.proj, ".codex-workforce", "work", "run", "worker"), exist_ok=True)
+        with open(os.path.join(self.proj, ".codex-workforce", "work", "run", "worker",
+                               "HANDOFF.md"), "w") as fh:
+            fh.write("1. " + order + "\n2. done\n")
+        path = os.path.join(self.proj, ".codex-workforce", "work", "run", "worker", "OUTPUT.md")
+        old = W.at_cap
+        W.at_cap = lambda _p: (3, 3, 1)
+        try:
+            out = W.cap_perf(payload, path, order, (3, 3, 1))
+        finally:
+            W.at_cap = old
+        self.assertIn(".codex-workforce/personnel", out.get("systemMessage", ""))
+        self.assertTrue(os.path.isdir(os.path.join(self.proj, ".codex-workforce", "personnel")))
+        self.assertTrue(any(n.startswith("PERF-") for n in os.listdir(
+            os.path.join(self.proj, ".codex-workforce", "personnel"))))
+        self.assertFalse(os.path.exists(os.path.join(self.proj, ".claude")))
+
+    def test_web_only_research_opens_hearing(self):
+        """The F02 case: a `web_fetch` must count as OUTSIDE evidence. The turn's ask is a
+        world/history question, so widen's applicable sense is hearing; without the map it
+        sees zero outside calls and blocks. With it, the claim has its channel."""
+        q = "what is the latest version of the API?"
+        reply = "The latest version is 3.2, from the official release page."
+        r = self.write_rollout(rollout_rows(
+            q, [("web_fetch", {"url": "https://example.test/releases"}, "version 3.2")], reply))
+        self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        out = self.hook("stop", self.payload(r, hook_event_name="Stop", stop_hook_active=False,
+                                             last_assistant_message=reply))
+        self.assertNotEqual(out.get("decision"), "block", out)
+
+    def test_web_only_research_without_the_fetch_would_block(self):
+        """Control for the test above: the same reply and ask with no outside read trips
+        the missing-hearing rule. This proves the passing test is not vacuous."""
+        q = "what is the latest version of the API?"
+        reply = "The latest version is 3.2, from the official release page."
+        r = self.write_rollout(rollout_rows(q, [], reply))
+        self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        out = self.hook("stop", self.payload(r, hook_event_name="Stop", stop_hook_active=False,
+                                             last_assistant_message=reply))
+        self.assertEqual(out.get("decision"), "block", out)
+
+    def test_null_transcript_is_reported_not_judged(self):
+        out = self.hook("stop", {"session_id": "s1", "turn_id": "t1", "cwd": self.proj,
+                                 "hook_event_name": "Stop", "transcript_path": None,
+                                 "last_assistant_message": "done"})
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertIn("not judged", out.get("systemMessage", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.proj, ".claude")))
+
+    def test_ephemeral_subagent_null_paths_are_reported(self):
+        out = self.hook("stop", {"session_id": "s1", "turn_id": "t1", "cwd": self.proj,
+                                 "hook_event_name": "SubagentStop",
+                                 "transcript_path": None,
+                                 "agent_transcript_path": None,
+                                 "last_assistant_message": "done"})
+        self.assertIn("not judged", out.get("systemMessage", ""))
+        self.assertIn("agent_transcript_path", out.get("systemMessage", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.proj, ".claude")))
+
     def test_turn_end_rows_and_sidechain(self):
         rows = rollout_rows("do the subtask", [], "done")
         rows.append({"type": "event_msg", "payload": {"type": "task_complete"}})
@@ -139,6 +246,92 @@ class SenseTests(unittest.TestCase):
             typed = [json.loads(l) for l in fh]
         self.assertTrue(all(r.get("isMeta") for r in typed
                             if r["type"] == "user" and isinstance(r["message"]["content"], str)))
+
+    # ── generated skills and custom agents ───────────────────────────────────
+
+    def test_generated_skills_are_eight_and_speak_codex(self):
+        """Generation is a product surface: all eight upstream skills, `$cwf-` invocation,
+        no Claude command namespace or `.claude/` state path, and valid YAML metadata."""
+        import yaml
+        base = os.path.join(ROOT, ".agents", "skills")
+        skills = sorted(d for d in os.listdir(base)
+                        if d.startswith("cwf-") and os.path.isfile(
+                            os.path.join(base, d, "SKILL.md")))
+        self.assertEqual(skills, ["cwf-blueprint", "cwf-code-evaluator", "cwf-records-code-map",
+                                  "cwf-security-evaluator", "cwf-shared-artifact", "cwf-text-eval",
+                                  "cwf-timezone", "cwf-ui-design"])
+        for name in skills:
+            p = os.path.join(base, name, "SKILL.md")
+            with open(p, encoding="utf-8") as fh:
+                text = fh.read()
+            head = text.split("\n---\n", 1)[0].lstrip("---\n")
+            meta = yaml.safe_load(head)
+            self.assertEqual(meta.get("name"), name)
+            # Skip the generated-by comment: it names the upstream source path.
+            body = text.split("-->", 1)[-1]
+            for bad in (".claude/", "AskUserQuestion", "/blueprint", "/code-evaluator",
+                        "/records-code-map", "/security-evaluator", "/shared-artifact",
+                        "/text-eval", "/timezone", "/ui-design"):
+                self.assertNotIn(bad, body, f"{name} still carries {bad}")
+        with open(os.path.join(base, "cwf-blueprint", "SKILL.md"), encoding="utf-8") as fh:
+            self.assertIn("$cwf-blueprint", fh.read())
+
+    def test_generated_skill_scripts_start_and_stay_in_codex_paths(self):
+        """The skills name three scripts by path. A shipped copy that cannot start, or that
+        still writes `.claude/`, makes the documented command a dead end."""
+        code_eval = subprocess.run([sys.executable, os.path.join(ROOT, "cwf", "bin", "wf-code-eval"),
+                                    "--root", self.proj], capture_output=True, text=True, timeout=30)
+        self.assertEqual(code_eval.returncode, 0, code_eval.stderr)
+        self.assertIn("0 gate(s)", code_eval.stdout)
+        code_map = subprocess.run([sys.executable, os.path.join(ROOT, "cwf", "bin", "wf-map"),
+                                   "--root", self.proj, "--topic", "nothing-here"],
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(code_map.returncode, 0, code_map.stderr)
+        self.assertIn("nothing matched", code_map.stdout)
+        # The installed layout is <root>/cwf/bin. Both skills must use that path,
+        # not the upstream repository layout they were copied from.
+        for skill, needle in (("cwf-code-evaluator", "$WF/cwf/bin/wf-code-eval"),
+                              ("cwf-records-code-map", "$WF/cwf/bin/wf-map")):
+            with open(os.path.join(ROOT, ".agents", "skills", skill, "SKILL.md"),
+                      encoding="utf-8") as fh:
+                self.assertIn(needle, fh.read())
+        for name, forbidden in (
+                ("wf-code-eval", ('".claude"', "CLAUDE_CONFIG_DIR", "CLAUDE_PROJECT_DIR")),
+                ("wf-map", ('".claude"', "CLAUDE_PROJECT_DIR")),
+                # wf-census carries unrelated Claude-era audit helpers; only the paths
+                # wf-code-eval reaches are in scope, and those are checked by the run above.
+                ("wf-census", ('os.environ.get("CLAUDE_CONFIG_DIR")',))):
+            with open(os.path.join(ROOT, "cwf", "bin", name), encoding="utf-8") as fh:
+                text = fh.read()
+            for bad in forbidden:
+                self.assertNotIn(bad, text, name)
+
+    def test_readme_counts_match_generated_tree(self):
+        with open(os.path.join(ROOT, "AGENTS.md"), encoding="utf-8") as fh:
+            agents_md = fh.read()
+        self.assertIn("eight upstream skills", agents_md)
+        self.assertIn("nine Codex custom agents", agents_md)
+        with open(os.path.join(ROOT, "VERSION")) as fh:
+            self.assertIn("VERSION` holds the release (`" + fh.read().strip(), agents_md)
+
+    def test_generated_custom_agents_parse_and_state_host_limits(self):
+        import tomllib
+        base = os.path.join(ROOT, "cwf", "agents")
+        files = sorted(f for f in os.listdir(base) if f.endswith(".toml"))
+        self.assertEqual(len(files), 9)
+        for fn in files:
+            with open(os.path.join(base, fn), "rb") as fh:
+                data = tomllib.load(fh)
+            for key in ("name", "description", "developer_instructions"):
+                self.assertTrue(data.get(key), f"{fn} lacks {key}")
+            self.assertTrue(data["name"].startswith("cwf-") or data["name"] in (
+                "code-design-advisor", "deadcode-gardener"))
+            self.assertIn("Host limits:", data["developer_instructions"])
+            self.assertNotIn("tools =", data)
+            self.assertNotIn("disallowedTools =", data)
+            for bad in (".claude/", "CLAUDE_PROJECT_DIR", "AskUserQuestion",
+                        "shutdown_request"):
+                self.assertNotIn(bad, data["developer_instructions"], fn)
 
     # ── prompt hook ─────────────────────────────────────────────────────────
 
@@ -277,6 +470,39 @@ class SenseTests(unittest.TestCase):
             self.assertNotIn(claude_only, prompt)
         self.assertIn('{"ok": true}', prompt)
 
+    def test_real_juror_ok_is_visible_not_a_silent_pass(self):
+        """A juror that checked and acquitted must leave its reason in the Stop output.
+        Notes alone are not enough: an empty notes list was indistinguishable from a
+        judge that never ran, which is the silent pass the live smoke test found."""
+        q = "Run exactly one command: printf OK. Then report that it ran."
+        reply = "I ran printf OK."
+        r = self.write_rollout(rollout_rows(
+            q, [("exec_command", {"cmd": "printf OK"}, "OK")], reply))
+        self.env["WF_AUDIT_SAMPLE"] = "1"
+        self.hook("prompt", self.payload(r, hook_event_name="UserPromptSubmit", prompt=q))
+        # Load the extensionless hook as a module so the juror can be patched in-process;
+        # the hook itself still runs the real ledger and widen and writes a real flag.
+        loader = importlib.machinery.SourceFileLoader("cwf_hook_under_test", HOOK)
+        spec = importlib.util.spec_from_loader("cwf_hook_under_test", loader)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        old = cwf_juror.judge
+        cwf_juror.judge = lambda *_a, **_k: ({
+            "ok": True, "reason": "touch: ran printf and saw OK", "notes": []}, "")
+        try:
+            payload = self.payload(r, hook_event_name="Stop", stop_hook_active=False,
+                                   last_assistant_message=reply)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(hook.stop_event(payload), 0)
+        finally:
+            cwf_juror.judge = old
+        out = json.loads(buf.getvalue())
+        self.assertEqual(len(glob.glob(os.path.join(
+            self.proj, ".codex-workforce", "scratch", "s1", "wf-widen-flag.*.json"))), 1)
+        self.assertNotEqual(out.get("decision"), "block", out)
+        self.assertIn("cwf juror: touch: ran printf and saw OK", out.get("systemMessage", ""))
+
     # ── state directory safety ──────────────────────────────────────────────
 
     def test_symlinked_state_dir_is_refused_and_nothing_leaks(self):
@@ -311,7 +537,9 @@ class SenseTests(unittest.TestCase):
              "crushrc", ".opencode/x", ".playwright-mcp/page.yml",
              ".codex-workforce/issues/s.json",
              "tests/__pycache__/x.pyc", ".env"]
-    PACKAGE = ["AGENTS.md", "RESUME.md", ".agents/skills/cwf-blueprint/SKILL.md", ".codex/hooks.json",
+    PACKAGE = ["AGENTS.md", "RESUME.md", ".agents/skills/cwf-blueprint/SKILL.md",
+               ".agents/skills/cwf-code-evaluator/SKILL.md",
+               ".agents/skills/cwf-text-eval/SKILL.md", ".codex/hooks.json",
                "cwf/bin/cwf-hook", "cwf/lib/cwf_codex.py", "scripts/sync-upstream",
                "tests/test_senses.py", "upstream/claude-workforce/UPSTREAM.md", ".gitignore"]
 

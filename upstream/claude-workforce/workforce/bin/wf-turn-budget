@@ -203,7 +203,9 @@ def final_pending(home, state, cap):
 # filled, the work order in section 1 reproduced verbatim", and before 2026-10-12 that
 # pointed at a format defined in no file on disk — `wf-handoff`, the producer, had been
 # retired in the simplification release, so `HANDOFF` had a consumer and nothing that
-# could satisfy it. `bin/check` requires these exact lines to appear in both files.
+# could satisfy it. `bin/check` required these exact lines to appear in both files until
+# `bin/check` was retired on 2026-10-14;
+# nothing keeps them in agreement now.
 BRIEF_SECTIONS = """1. The work order, verbatim — the `REQUEST (verbatim):` block unchanged, never summarised
 2. Exit criteria, each MET or UNMET, with its evidence
 3. What is done, and the file or command that shows it
@@ -912,7 +914,8 @@ def _task_tag():
     import importlib.machinery
     import importlib.util
     # NEVER WRITE BYTECODE: a `__pycache__/` beside a shipped script is an undeclared
-    # shipped file, which `bin/check` fails on. `wf-widen`'s `_sibling` carries the
+    # shipped file, which `bin/check` failed on until it was retired on 2026-10-14. `wf-widen`'s
+    # `_sibling` carries the
     # same line for the same reason.
     sys.dont_write_bytecode = True
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wf-task-tag")

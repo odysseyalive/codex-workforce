@@ -144,6 +144,14 @@ if [ "$ACTION" = uninstall ]; then
       fi
     done < "$INSTALL_DIR/installed-skills.txt"
   fi
+  if [ -f "$INSTALL_DIR/installed-agents.txt" ]; then
+    while IFS= read -r name; do
+      if printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]+\.toml$' && [ "${name#*..}" = "$name" ] \
+         && [ ! -L "$CONF_DIR/agents/$name" ]; then
+        rm -f "${CONF_DIR:?}/agents/$name"
+      fi
+    done < "$INSTALL_DIR/installed-agents.txt"
+  fi
   rm -rf "$INSTALL_DIR"
   [ -f "$HOOKS_JSON" ] && edit_hooks remove
   say "removed from $SCOPE scope ($INSTALL_DIR). Other hooks in $HOOKS_JSON were kept."
@@ -189,6 +197,19 @@ if [ -d "$STAGE/files/.agents/skills" ]; then
     rm -rf "${SKILLS_DIR:?}/$name"
     cp -R "$skill" "$SKILLS_DIR/$name"
     echo "$name" >> "$INSTALL_DIR/installed-skills.txt"
+  done
+fi
+# Custom agents are not skills: Codex discovers them only in .codex/agents/. Copy them
+# into .codex/agents beside the hooks; they are not skills and must not be listed for
+# skill uninstall.
+: > "$INSTALL_DIR/installed-agents.txt"
+if [ -d "$STAGE/files/cwf/agents" ]; then
+  mkdir -p "$CONF_DIR/agents"
+  for agent in "$STAGE"/files/cwf/agents/*.toml; do
+    [ -e "$agent" ] || continue
+    name="$(basename "$agent")"
+    cp "$agent" "$CONF_DIR/agents/$name"
+    echo "$name" >> "$INSTALL_DIR/installed-agents.txt"
   done
 fi
 

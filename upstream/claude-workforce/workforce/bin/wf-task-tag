@@ -40,6 +40,7 @@ both ends of the turn.
 EXIT CODES: 0 always. An unclassifiable ask is the common case and produces silence.
 """
 
+import calendar
 import hashlib
 import json
 import os
@@ -187,6 +188,48 @@ def peer_sender(peer):
     each through `flat_sender` again so a `peer` from anywhere reads the same. The ONE place
     the choice is made, so the index row and the checklist line never name it differently."""
     return flat_sender(peer.get("from-name")) or flat_sender(peer.get("from"))
+
+
+# A PEER'S POINTER IS NOT AN ASK. agent-say types a long message into the pane as one of two
+# sentences naming where to read it, and the ask is in the message it leads to. MEASURED
+# 2026-11-11 in this repository's session `f9318dba`: the pointer was seeded as i27's only item
+# and printed as the Work row and the index's `ask`, so the list read "Long message, read it by
+# running: agent-say show ... To answer, run the shell command: ..." where an ask belonged. 126
+# of the 340 peer deliveries in this machine's transcripts are a pointer.
+PEER_POINTER = re.compile(
+    r"\A(?:Long message, read it by running|A message from an agent on another computer "
+    r"\(not your user\) is waiting; read it with): agent-say show (\d{14}-\d{1,10})\."
+    r"(?: To answer, run the shell command: .*)?\Z", re.S)
+DELIVERY_ID = re.compile(r"(\d{14})-(\d{1,10})")
+
+
+def delivery_id(text):
+    """`(the UTC second, the agent-say process number, the id)` for one agent-say message id,
+    `<YYYYmmddHHMMSS>-<pid>`, or None."""
+    m = DELIVERY_ID.fullmatch(text) if isinstance(text, str) else None
+    if not m:
+        return None
+    try:
+        at = calendar.timegm(time.strptime(m.group(1), "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
+    return at, m.group(2), text
+
+
+def pointer_id(prompt):
+    """`delivery_id` of the id a peer's pointer names, or None for any other text."""
+    m = PEER_POINTER.match(" ".join(str(prompt or "").split()))
+    return delivery_id(m.group(1)) if m else None
+
+
+def ask_text(prompt, peer=None):
+    """The words an item, a row or the index shows for a message: the message flattened to one
+    line, or for a peer's pointer a short label naming its sender and id, never the pointer."""
+    ptr = pointer_id(prompt)
+    if ptr is None:
+        return " ".join(str(prompt or "").split())
+    who = peer_sender(peer) if isinstance(peer, dict) else ""
+    return f"message from {who} ({ptr[2]})" if who else f"peer message ({ptr[2]})"
 
 
 # THE IMPERATIVE, for the `work` kind below: a sentence that OPENS on an action verb, after
@@ -851,7 +894,8 @@ ISSUES = "issues"
 # THE IGNORE RULE'S WHOLE BODY: every file in the issues directory, and no path outside it.
 # Named here rather than spelled at the write, so the one thing a reader has to check about
 # it — that it is `*` and not a broader pattern aimed a level up — is checkable in one
-# place. `bin/check` pins this constant; `issues_dir` is the only writer.
+# place. `bin/check` pinned this constant until it was retired on 2026-10-14; `issues_dir` is the
+# only writer.
 IGNORE_RULE = "*\n"
 
 # THE THREE STATES AN AGENT ENTRY CAN BE IN, declared here because the ledger is the only
@@ -1151,7 +1195,10 @@ def refresh_index(payload, led):
         rows.append({"id": iss.get("id"),
                      # THE ASK IN SHORT, so the index is readable without opening the
                      # ledger. The full prompt stays in the session's own file.
-                     "ask": (iss.get("prompt") or "")[:120],
+                     # A PEER'S POINTER IS ITS LABEL (`ask_text`); any other prompt as it was.
+                     "ask": (ask_text(iss.get("prompt"), iss.get("peer"))
+                             if pointer_id(iss.get("prompt"))
+                             else str(iss.get("prompt") or ""))[:120],
                      # WHO ASKED, when it was a peer session and not the user here.
                      **({"from": peer_sender(iss["peer"])}
                         if isinstance(iss.get("peer"), dict) else {}),
@@ -1160,8 +1207,8 @@ def refresh_index(payload, led):
                      # somebody who cannot see the session's file: leaving it out would show
                      # `items_open: 0, agents_running: 0` for `/agenda today` two hours into
                      # its work, the shape of a finished issue. A follow-up that only adds
-                     # context is not hidden here; it folds into its issue (`absorb_items`,
-                     # and the checklist line in `start_checklist` that asks for the fold).
+                     # context is not hidden here; its one `answered` item closes its own
+                     # issue at the next submit (`start_checklist`), and the row goes.
                      "items_open": len([x for x in issue_items(iss)
                                         if not item_done(x)]),
                      "agents_running": len([a for a in issue_agents(iss)
@@ -1426,7 +1473,7 @@ def add_issue(payload, led):
     # THE MESSAGE IS ITS OWN FIRST ITEM FROM THE MOMENT IT IS SENT (`fallback_item`), because
     # this is the one event every user message reaches. See `track_message` for what was
     # measured when the item waited for the Stop.
-    fallback = fallback_item(prompt)
+    fallback = fallback_item(prompt, peer=payload.get("peer"))
     iss = {"id": "i%d" % n, "prompt": prompt[:2000], "state": "open",
            "items": [fallback] if fallback else [], "agents": [], "opened_at": utc_now()}
     # A PEER SESSION'S REQUEST NAMES ITS SENDER (`peer_request`), so a reader of the ledger
@@ -1437,15 +1484,99 @@ def add_issue(payload, led):
     return iss
 
 
-def fallback_item(prompt, status="open"):
+def fallback_item(prompt, status="open", peer=None):
     """The user's message as the hook's own item on its issue, or None for an empty one.
 
     Flattened to one line and cut to `CARRY_ASK`, the cut a carried row gets, so the session
     can mark it through the carry like any item it wrote. `fallback: true` keeps it out of
-    `session_items`, so no verdict that can reach the user as a failure ever reads it.
+    `session_items`, so no verdict that can reach the user as a failure ever reads it. A peer's
+    pointer is its label (`ask_text`), never the pointer's own sentence.
     """
-    text = " ".join(str(prompt or "").split())[:CARRY_ASK]
+    text = ask_text(prompt, peer)[:CARRY_ASK]
     return {"ask": text, "status": status, "fallback": True} if text else None
+
+
+# ONE PEER MESSAGE DELIVERED SEVERAL TIMES IS ONE ISSUE. MEASURED 2026-11-11 in this
+# repository's session `f9318dba`: codex-dev's notice was typed into the pane three times in
+# 0.8 s and a reworded follow-up 0.7 s later (ids ...170148, ...170149 twice, ...170150, all
+# from agent-say process 1117998), and they opened i16 to i19; ...161049 and ...161050 opened i14 and i15 the same way.
+#
+# WHAT SEPARATES A REPEAT FROM A SECOND MESSAGE, MEASURED the same day over this machine's 457
+# transcripts (347 peer deliveries), each delivery compared with its sender's previous one by
+# the body in agent-say's mailbox. Same body: 0.7, 0.8, 1.4 and 2.2 s apart from the same
+# agent-say process, and once 5.3 s apart from another process. Different message: 234 pairs,
+# the nearest 0.7 s from the same process (...170149 then ...170150, reworded) and 6.1 s from
+# different processes; ra-root's relay kept one process for hours and sent six different
+# messages from it, the nearest two 51 s apart. No envelope field separates all of them, so
+# the rule takes the cheaper error each way: a pointer folds only from the SAME process within
+# the window, a typed message only with the SAME words, never on sender and time alone. The
+# 5.3 s resend from another process stays an issue of its own; the 0.7 s second message from
+# one process is folded, and loses nothing, because the fold below records its id. Matching
+# the id's last digit would miss ...161049 / ...161050, so the ids' own times are compared.
+#
+# The hook sees the pointer, never the message behind it, so a fold has to lose nothing: each
+# repeat is recorded on the issue under `repeats`, and the session is told to read every id
+# there. A message typed in whole carries no id, so for one the same sender's same words
+# within the window are the repeat.
+REPEAT_WINDOW = 10
+# HOW MANY OF THE NEWEST ISSUES A DELIVERY IS COMPARED WITH, and how many repeats one issue
+# keeps. A burst is a handful; the bound keeps a long-lived ledger from growing a list.
+REPEAT_SCAN = 8
+REPEATS_MAX = 10
+
+
+def _iso_seconds(text):
+    """The epoch second of a `utc_now` stamp, or None."""
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def issue_repeats(iss):
+    """The `repeats` an issue records, objects only, oldest first."""
+    rows = iss.get("repeats") if isinstance(iss, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def repeat_of(led, payload, now=None):
+    """The issue this peer delivery repeats (`REPEAT_WINDOW`), or None.
+
+    The same sender, and either a pointer from the same agent-say process whose id is within
+    the window of a delivery already on that issue, or a message typed in whole with the same
+    words within the window of the last time that issue was delivered. A message the user
+    typed is never a repeat: only a peer's delivery (`peer`) is compared.
+    """
+    peer = payload.get("peer")
+    if not isinstance(peer, dict):
+        return None
+    who = peer_sender(peer)
+    body = " ".join(str(payload.get("prompt") or "").split())
+    if not who or not body:
+        return None
+    ptr = pointer_id(body)
+    now = time.time() if now is None else now
+    for iss in reversed([i for i in led.get("issues", []) if isinstance(i, dict)][-REPEAT_SCAN:]):
+        if not isinstance(iss.get("peer"), dict) or peer_sender(iss["peer"]) != who:
+            continue
+        reps = issue_repeats(iss)
+        if ptr is not None:
+            seen = [pointer_id(iss.get("prompt"))] + [delivery_id(r.get("id")) for r in reps]
+            if any(d and d[1] == ptr[1] and abs(d[0] - ptr[0]) <= REPEAT_WINDOW for d in seen):
+                return iss
+        elif body == " ".join(str(iss.get("prompt") or "").split()):
+            last = [t for t in [_iso_seconds(iss.get("opened_at"))]
+                    + [_iso_seconds(r.get("at")) for r in reps] if t is not None]
+            if last and now - max(last) <= REPEAT_WINDOW:
+                return iss
+    return None
+
+
+def note_repeat(iss, payload):
+    """Record this delivery on the issue it repeats, newest last, at most `REPEATS_MAX`."""
+    ptr = pointer_id(payload.get("prompt"))
+    row = {"at": utc_now(), **({"id": ptr[2]} if ptr else {})}
+    iss["repeats"] = (issue_repeats(iss) + [row])[-REPEATS_MAX:]
 
 
 def stale_empty(iss):
@@ -1529,7 +1660,7 @@ def heal_empty(led):
     healed = 0
     for iss in open_issues(led):
         if stale_empty(iss):
-            item = fallback_item(iss.get("prompt"), "superseded")
+            item = fallback_item(iss.get("prompt"), "superseded", iss.get("peer"))
             iss["items"] = [item] if item else []
         elif stale_notice(iss):
             for item in issue_items(iss):
@@ -1562,61 +1693,44 @@ def absorb_items(led, issue_id, items, title=""):
                 if isinstance(i, dict) and i.get("id") == issue_id), None)
     if own is None:
         return
-    # A CONTINUATION JOINS ITS ISSUE. An item the session tagged `"issue": "<earlier id>"`
-    # belongs to that earlier issue, so it lands there, merged by its wording so a re-absorb
-    # never duplicates it. The session decides what continues what; nothing here infers it.
+    # A CONTINUATION STAYS WHERE IT WAS ASKED AND NAMES THE ISSUE IT CONTINUES. An item the
+    # session tagged `"issue": "<earlier id>"` is this message's item, kept on this issue with
+    # `"continues": "<that id>"`. The session decides what continues what; nothing here infers
+    # it, and nothing here moves it.
     #
-    # OPEN OR CLOSED. MEASURED 2026-10-29 in mutze-studio `29c3e592` on 1.82.1: i8 only added
-    # context to i7, which was already closed, and wrote the one `"issue": "i7"`, `"answered"`
-    # item the checklist line asks for; with open issues alone as targets the item stayed on
-    # i8, which closed as an issue of its own. A moved item not yet finished REOPENS a closed
-    # target, since new work arrived on it; finished ones leave it closed. `absorb_carried`
-    # still ignores a closed issue: a carried row is the hook's own hand-out coming back, a
-    # continuation is the session naming where its item belongs.
-    #
-    # NEVER ONTO A FOLDED ISSUE (`merged`). It holds nothing and was never an issue of its own,
-    # so an item naming one stays on this message, as it did when only open issues were named.
-    targets = {i.get("id"): i for i in led.get("issues", [])
-               if isinstance(i, dict) and i is not own and not i.get("merged")}
-    mine, moved = [], 0
+    # IT USED TO MOVE, and the move is the defect. Through 1.88.0 the item was appended to the
+    # earlier issue and a message whose every item moved was folded (`merged`, `items: []`).
+    # MEASURED 2026-11-11 in this repository's session `f9318dba`: codex-dev's messages i26
+    # and i28 were folded empty, i25 held four near-identical items, and i27, folded over a
+    # running coder, kept only the hook's fallback, the peer's pointer sentence, which the
+    # next message carried back as open over the `answered` the session had written. The
+    # user wants every ask visible where it was asked, so an issue whose own list held items
+    # now holds those items. A context-only message's one `"answered"` item closes its own
+    # issue at the Stop, which is what the fold was for; an unfinished continuation keeps its
+    # own issue open rather than reopening the earlier one. A `merged` issue an older release
+    # folded is unfolded when its message's list is absorbed again.
+    known = {i.get("id") for i in led.get("issues", []) if isinstance(i, dict) and i is not own}
+    mine = []
     for it in items:
         row = {"ask": it["ask"],
                "status": it["status"] if isinstance(it.get("status"), str) else "open"}
-        dest = targets.get(it.get("issue")) if isinstance(it.get("issue"), str) else None
-        if dest is None:
-            mine.append(row)
-            stamp_item(own, row)
-            continue
-        moved += 1
-        have = dest.setdefault("items", [])
-        same = next((x for x in have if isinstance(x, dict) and x.get("ask") == row["ask"]), None)
-        if same is None:
-            have.append(row)
-            stamp_item(dest, row)
-        else:
-            mark_item(dest, same, row["status"])
-        if dest.get("state") == "closed" and not item_done(row):
-            reopen_issue(dest)
+        link = it.get("issue")
+        if isinstance(link, str) and link != issue_id and link in known:
+            row["continues"] = link
+        mine.append(row)
+        stamp_item(own, row)
     if title:
         own["title"] = title
-    if moved and not mine and not any(a.get("state") == "running" for a in issue_agents(own)):
-        # EVERYTHING THIS MESSAGE ASKED CONTINUES AN EARLIER ISSUE, so it opens nothing of
-        # its own: folded, which `open_issues` reads as closed. Never over a running agent,
-        # whose result would land on an issue nobody reads.
-        own["merged"] = True
-        own["items"] = []
-        close_issue(own)
-        return
-    if own.pop("merged", None):
-        # A FOLD IS UNDONE when the same message later gets items of its own.
+    if mine and own.pop("merged", None):
         reopen_issue(own, None)
     if not mine and any(i.get("fallback") is True for i in issue_items(own)):
         return
     # AN EMPTY LIST NEVER ERASES ITEMS THE SESSION WROTE. MEASURED 2026-10-28, mutze session
     # `6caae2f5`: i22's one written item was gone by the session's end, `items: []`. Both
     # ways here end in that write: a list holding nothing for this issue (another turn's
-    # file, or a carry-only one), and a fold refused over a running agent. A withdrawn
-    # ask is marked "dropped", never deleted, so nothing legitimate is lost.
+    # file, or a carry-only one), and a fold refused over a running agent (the fold was
+    # removed after 1.88.0). A withdrawn ask is marked "dropped", never deleted, so nothing
+    # legitimate is lost.
     if not mine and session_items(own):
         return
     own["items"] = mine
@@ -1781,9 +1895,14 @@ def late_marks(payload, led):
     more rule. An item already finished is never touched, so a stale list cannot reopen it; a
     status that is not finished is ignored, so a list cannot hold an item open either. Nothing
     is appended, and a closed issue is never written (`open_issues`). Each item lands on the
-    issue `absorb_items` put it on: the one its `"issue"` names when that issue is in the
-    ledger and not folded, else the message's own, which the file's key names. Carried rows
-    name their issue themselves.
+    issue `absorb_items` put it on, the message's own, which the file's key names, whatever
+    issue it `"continues"`. Carried rows name their issue themselves.
+
+    IT ALSO RUNS BEFORE ANY CARRIED ROW IS BUILT (`start_checklist`, `restore_carried`,
+    `open_elsewhere`), because a row built from a ledger that has not read a list's newer
+    mark hands a finished item back as open. MEASURED 2026-11-10 in this repository's
+    session `f9318dba`, 17:33: i2's ask was marked `answered` in i2's list while i3 was
+    queued, and i3's display restored it as an open carried row.
 
     THE SESSION'S FILES ONLY. The name must be exactly `checklist_path`'s for a keyed record
     of this session (`wf-asks.<state component>.i<N>.json`, or the bare one), in the
@@ -1815,15 +1934,11 @@ def late_marks(payload, led):
     except OSError:
         return 0
     keys.sort(reverse=True)
-    known = {i.get("id"): i for i in led.get("issues", []) if isinstance(i, dict)}
     landed = 0
     for key in [f"i{k}" for k in keys[:LATE_MAX]] + [None]:
         cl = read_json_nofollow(os.path.join(d, f"{lead}{key}.json") if key else bare)
         marks = [(r["issue"], r) for r in carried_items(cl)]
-        for it in checklist_items(cl) if key else ():
-            tag = it.get("issue") if isinstance(it.get("issue"), str) else None
-            home = known.get(tag) if tag != key else None
-            marks.append((tag if home is not None and not home.get("merged") else key, it))
+        marks += [(key, it) for it in (checklist_items(cl) if key else ())]
         for iid, row in marks:
             iss = issues.get(iid)
             if iss is None or not item_done(row):
@@ -1894,7 +2009,7 @@ def track_message(led, issue_id, written):
                 mark_item(iss, item, "superseded")
     if target is None or written or issue_items(target) or issue_agents(target):
         return
-    item = fallback_item(target.get("prompt"))
+    item = fallback_item(target.get("prompt"), peer=target.get("peer"))
     if item:
         target["items"] = [item]
 
@@ -2496,6 +2611,15 @@ def judge_issue(iss):
     return "open", "nothing recorded against it"
 
 
+def close_finished(iss):
+    """Close an issue `judge_issue` calls closed, and retire its `handoff` marks
+    (`judge_ledger` says why)."""
+    close_issue(iss)
+    for a in issue_agents(iss):
+        if a.get("state") == "handoff":
+            a["state"] = "returned"
+
+
 def judge_ledger(payload, led):
     """Judge EVERY open issue, close the finished ones, and return the verdict rows.
 
@@ -2518,11 +2642,9 @@ def judge_ledger(payload, led):
     for iss in open_issues(led):
         verdict, why = judge_issue(iss)
         if verdict == "closed":
-            close_issue(iss)
-            for a in issue_agents(iss):
-                if a.get("state") == "handoff":
-                    a["state"] = "returned"
-        rows.append((iss.get("id"), verdict, why, plain_text(iss.get("prompt"), EXCERPT_MAX), iss))
+            close_finished(iss)
+        rows.append((iss.get("id"), verdict, why,
+                     plain_text(ask_text(iss.get("prompt"), iss.get("peer")), EXCERPT_MAX), iss))
     return rows
 
 
@@ -2566,8 +2688,8 @@ def opens_issue(prompt):
 # THE TWO SENTENCES WITH TWO READERS, EACH WRITTEN ONCE. A turn that opens no asks of its
 # own still names the same file and the same carried rows (`carry_only_checklist`), so both
 # sentences are now said in two places — and a second COPY of either one in this file is the
-# copy that drifts, as well as the thing that would make `bin/check`'s grep for the carried
-# words vacuous: breaking one copy would no longer break the pin.
+# copy that drifts. (`bin/check`'s grep for the carried words was the pin on them; it was
+# retired on 2026-10-14, and nothing pins them now.)
 # THE KEY SET NAMES `"titles"` WHEN THE TITLES LINE IS SAID (`checklist_head`). MEASURED
 # 2026-10-29 in mutze-studio `29c3e592`: with the head listing three keys, the session read
 # `"titles"` as outside the file's schema and never wrote it.
@@ -2619,6 +2741,12 @@ TITLES_LINE = ("No title yet on %s: give each a few words in "
 # never said who sent it, though the issue records `peer`. And a pure FYI from a peer opens an
 # issue too, deliberately, since a hook cannot tell an FYI from a request without classifying
 # free text; so the session is told how to close one. Said on a peer's message only.
+# A REPEAT DELIVERY IS SAID TO BE ONE (`repeat_of`), with where its id went, because the hook
+# folds on the envelope and only the session can read what the message behind it says.
+REPEAT_LINE = (" This message from \"%s\" repeats the peer message already on issue %s: the "
+               "same sender's messenger delivered it again within seconds, so it opens no "
+               "issue of its own and its delivery is recorded on %s under \"repeats\". Read "
+               "it, and put anything new in it on that issue.")
 PEER_LINE = (" This message came from the peer session \"%s\", not from the user. "
              "A peer message that asks for nothing gets one item stating what it said, with "
              "\"status\": \"answered\", and the issue closes.")
@@ -2803,6 +2931,7 @@ def restore_carried(at, path, rec, cl):
         return 0
     own = rec.get("issue") if bare_name(rec.get("issue")) else None
     led = load_ledger(at)
+    late_marks(at, led)
     kept = carried_items(cl)
     have = {(r["issue"], r["ask"][:CARRY_ASK]) for r in kept}
     back = [r for r in carry_forward(led, skip=own)
@@ -2840,6 +2969,7 @@ def open_elsewhere(at, d, rec, cl, records):
     fallback until that turn's Stop absorbs the list."""
     own = rec.get("issue")
     led = load_ledger(at)
+    late_marks(at, led)
     titles = {i.get("id"): plain_text(i.get("title"), TITLE_MAX) for i in open_issues(led)}
     marks = {(r["issue"], r["ask"][:CARRY_ASK]): r.get("status") for r in carried_items(cl)}
     live = {}
@@ -2856,8 +2986,7 @@ def open_elsewhere(at, d, rec, cl, records):
              r["ask"])
             for r in (carry_forward(led, skip=own) if open_issues(led) else carried_items(cl))
             if r["issue"] not in live]
-    rows += [(it["issue"] if bare_name(it.get("issue")) else rid, it.get("status"), it["ask"])
-             for rid, its in live.items() for it in its]
+    rows += [(rid, it.get("status"), it["ask"]) for rid, its in live.items() for it in its]
     groups, seen, n = {}, set(), 0
     for gid, st, ask in rows:
         st = plain_text(st, 40) or "open"
@@ -2903,16 +3032,20 @@ def earlier_records(tag):
     A record from an older release has no `earlier` key and is kept like any other, which is
     the whole heal. Capped at `EARLIER_MAX`: one queued message needs one, and an unmatched
     record ages out instead of growing the file.
+
+    A REPEAT DELIVERY'S RECORD IS NEVER KEPT (`repeat_of`). It opened nothing and its list is
+    the repeated issue's, whose own record is kept; in `f9318dba` one burst was four
+    deliveries, and keeping each would push the first one's record out of the cap.
     """
     if not isinstance(tag, dict) or not isinstance(tag.get("prompt"), str):
         return []
     top = {k: v for k, v in tag.items() if k != "earlier"}
     older = tag.get("earlier")
     older = [r for r in older if isinstance(r, dict)] if isinstance(older, list) else []
-    return ([top] + older)[:EARLIER_MAX]
+    return [r for r in [top] + older if not r.get("repeat_of")][:EARLIER_MAX]
 
 
-def start_checklist(payload, prev=None, earlier=()):
+def start_checklist(payload, prev=None, earlier=(), notes=None):
     """Replace last turn's checklist with an empty one for this ask. Returns the context line
     naming it ("" when this message gets none) and the record the tag carries (None when none).
 
@@ -2923,6 +3056,12 @@ def start_checklist(payload, prev=None, earlier=()):
 
     A MESSAGE THAT OPENS NO LIST OF ITS OWN STILL CARRIES this session's earlier open items,
     through `carry_only_checklist`, and gets no file at all when there are none.
+
+    A REPEAT DELIVERY OF A PEER'S MESSAGE OPENS NOTHING (`repeat_of`). Its turn keeps the list
+    of the issue it repeats while that list's turn is running, the way a notification mid-turn
+    does, so the repeat never writes over the first delivery's file; otherwise it gets the
+    carry-only list. `notes`, when given, is told `repeat_of`, which `main` records on the tag
+    so `earlier_records` never spends a slot on it.
     """
     prompt = payload.get("prompt") or ""
     p = checklist_path(payload, prev)
@@ -2952,7 +3091,7 @@ def start_checklist(payload, prev=None, earlier=()):
     # turn that wrote it has ended. `wf-widen`'s Stop does this too, one event earlier, so an
     # issue finished during a turn closes on that turn's Stop; this is the half that holds
     # when no Stop fired.
-    issue_id = None
+    issue_id, repeat = None, None
     carried, untitled, inline = [], [], None
     try:
         led = load_ledger(payload)
@@ -2962,18 +3101,34 @@ def start_checklist(payload, prev=None, earlier=()):
         landed += absorb_titles(led, checklist_titles(cl))
         if prev is not None:
             absorb_items(led, prev.get("issue"), checklist_items(cl), checklist_title(cl))
+            # AND A LIST THAT FINISHED ITS ISSUE CLOSES IT HERE, the verdict the next Stop would
+            # reach, so `index.json` is right at once. A context-only message's one `answered`
+            # item closed its issue at this submit while the fold existed; it still does.
+            done = next((i for i in open_issues(led) if i.get("id") == prev.get("issue")), None)
+            if done is not None and judge_issue(done)[0] == "closed":
+                close_finished(done)
+                landed += 1
         # AFTER THE ABSORB AND BEFORE THIS MESSAGE'S ISSUE, so what is healed is only what an
         # older release left empty (`heal_empty`).
         landed += heal_empty(led)
-        iss = add_issue(payload, led)
+        # EVERY LIST'S NEWER MARKS BEFORE ANY ROW IS BUILT, and before the remove below takes
+        # the ended lists away for good (`late_marks`).
+        landed += late_marks(payload, led)
+        repeat = repeat_of(led, payload)
+        if repeat is not None:
+            note_repeat(repeat, payload)
+            landed += 1
+        iss = add_issue(payload, led) if repeat is None else None
         issue_id = iss.get("id") if iss else None
         if iss is not None or prev is not None or landed:
             save_ledger(payload, led)
         # BUILT AFTER THE ABSORB AND AFTER THIS MESSAGE'S ISSUE EXISTS, so it reflects what
         # is open NOW: an item the last turn finished is not handed back to this one, and
-        # this message's own issue is skipped rather than carrying itself.
-        carried = carry_forward(led, skip=issue_id)
-        untitled = untitled_issues(led, skip=issue_id)
+        # this message's own issue is skipped rather than carrying itself. A repeat skips the
+        # issue it repeats, whose items are on that issue's own list.
+        skip = issue_id or (repeat.get("id") if repeat is not None else None)
+        carried = carry_forward(led, skip=skip)
+        untitled = untitled_issues(led, skip=skip)
     except OSError:
         pass
     bare = checklist_path(payload)
@@ -2987,6 +3142,19 @@ def start_checklist(payload, prev=None, earlier=()):
             os.remove(old)
         except OSError:
             pass
+    if repeat is not None:
+        rid = repeat.get("id")
+        if isinstance(notes, dict):
+            notes["repeat_of"] = rid
+        said = REPEAT_LINE % (peer_sender(payload["peer"]), rid, rid)
+        live = next((r for r in [prev] + [e.get("checklist") for e in earlier
+                                          if isinstance(e, dict)]
+                     if isinstance(r, dict) and r.get("issue") == rid and not r.get("ended")
+                     and os.path.exists(checklist_path(payload, r))), None)
+        if live is not None:
+            return said.strip(), live
+        line, record = carry_only_checklist(bare, carried, untitled, inline)
+        return (said.strip() + (" " + line if line else "")), record
     # Injected text opens no list of its own: it is not the user's ask. IT STILL CARRIES,
     # when this session has earlier open items — see `carry_only_checklist`, which is where
     # the measured hand-back case is written down.
@@ -3025,9 +3193,10 @@ def start_checklist(payload, prev=None, earlier=()):
             "\"answered\" when the work was answering it; one the user withdrew or sent by "
             "mistake is \"dropped\". Give the issue a short \"title\" of a few words; an item "
             "that continues an earlier issue, open or closed, carries \"issue\": <its id> and "
-            "is added there. A message that only adds context to an earlier issue gets one item "
+            "stays on this message's list, where it was asked. A message that only adds context "
+            "to an earlier issue gets one item "
             "stating that context, with \"issue\": <that id> and \"status\": \"answered\", "
-            "and so opens no issue of its own. The reply gives each item its "
+            "so its own issue closes with it. The reply gives each item its "
             "own section. At Stop the widening agent checks the list and the reply against the "
             "message."
             + (PEER_LINE % peer_sender(payload["peer"])
@@ -3706,8 +3875,11 @@ def main():
     # turn's Stop (`earlier_records`).
     _old_tag = read_json_nofollow(tag_path(payload))
     earlier = earlier_records(_old_tag)
+    _notes = {}
     checklist_line, checklist_record = start_checklist(
-        payload, previous_checklist(payload, _old_tag), earlier)
+        payload, previous_checklist(payload, _old_tag), earlier, _notes)
+    # A REPEAT DELIVERY'S TAG SAYS SO, and `earlier_records` drops it when it is replaced.
+    _repeat = {"repeat_of": _notes["repeat_of"]} if _notes.get("repeat_of") else {}
 
     hits = classify(payload.get("prompt") or "")
     # AN INJECTED TURN CARRIES THE DOCKET OF THE ISSUE IT SERVES (`served_ask`): the hits
@@ -3748,7 +3920,7 @@ def main():
                            "senses": [], "asks": _n, "asks_why": _how,
                            "checklist": checklist_record, "earlier": earlier,
                            **({"carried_docket": _carried} if _carried else {}),
-                           **({"peer": _peer[1]} if _peer else {})})
+                           **({"peer": _peer[1]} if _peer else {}), **_repeat})
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": "\n\n".join(
@@ -3780,7 +3952,7 @@ def main():
                        "checklist": checklist_record,
                        "earlier": earlier,
                        **({"docket_from": docket_from} if docket_from else {}),
-                       **({"peer": _peer[1]} if _peer else {})})
+                       **({"peer": _peer[1]} if _peer else {}), **_repeat})
 
     # STATED AS FACTS ABOUT THE ASK, NEVER AS AN INSTRUCTION. The hooks reference is
     # explicit that text framed as an out-of-band command trips the prompt-injection

@@ -1,0 +1,88 @@
+---
+name: code-evaluator
+description: 'Evaluate code to prevent common AI coding mistakes — dead code, duplication, complexity hotspots, reinvented helpers, leftover scaffolding. Two functions plus a pre-write advisor. Use after writing or editing code, when asked to review code quality, clean up the codebase, find unused code, find duplicates, check complexity, or evaluate what an AI just wrote. Commands: review (post-write), sweep (full codebase).'
+lane: coding
+code_eval_ref_version: 5
+allowed-tools: Read, Glob, Grep, Bash, Task, Skill
+strictness: standard
+---
+
+# Code Evaluator
+
+Prevents and removes the mistakes an AI coder commonly makes. Language-agnostic:
+uses ripgrep + native tools, no compiled analyzer required. Grounded in a strict
+safety model — grep proposes candidates, the compiler and the test suite decide.
+
+## Interface
+
+| Row | Contract |
+|---|---|
+| `Invoke` | /code-evaluator [review\|sweep] |
+| `Returns` | Findings on dead code, duplication, complexity hotspots, reinvented helpers, and leftover scaffolding, each with a confidence tier. Only HIGH-confidence guard-cleared dead code is auto-fix eligible. |
+| `Fails` | `wf-code-eval --stamp` exits 1 when the reviewed state could not be recorded; the review is then not finished. No other step declares an exit code. |
+
+## Commands
+
+| Command | Layer | Action |
+|---------|-------|--------|
+| `/code-evaluator review [path]` | L2 (post-write) | Evaluate a diff or path just written; tier findings; apply only HIGH-confidence, guard-cleared fixes |
+| `/code-evaluator sweep` | L3 (full codebase) | Whole-tree dead-code / duplication / complexity / over-engineering report (report-only at scale) |
+
+A third layer (**L1, pre-write**) is the `code-design-advisor` agent, spawned by
+*other* skills at non-obvious code decisions.
+It is not a user command — it advises before code is written.
+
+## Workflow
+
+### Steps
+
+1. **Candidate set follows the mode.** `review` → the diff. `sweep` → the whole
+   tree, report-only.
+2. **Read the grounding files below before detecting anything.**
+3. **Run the native-tool gate first**, then the ripgrep pipeline; reconcile every
+   finding against `references/guards.md`.
+4. **Tier every finding** HIGH / MEDIUM / LOW and display the plan before any
+   change.
+5. **Apply fixes one atomic change at a time through the safety cycle:** baseline
+   → remove → build → full tests → revert on any failure. Report mode is the
+   default; deletion requires an explicit `--execute`.
+6. **Enforcement coordination** runs on every `review`, as the section below states.
+7. **Agent fan-out.** The `deadcode-gardener` agent (L2) evaluates in a clean
+   context; a full `sweep` fans out one agent per top-level directory and
+   aggregates.
+
+## Enforcement coordination
+
+A project may wire a code-eval **commit gate**: a hook that blocks `git commit` and `git push`
+while the working tree differs from the hash in `.claude/.code-eval-reviewed`. The gate hooks
+belong to the project. **This skill writes the stamp they read**, through the shipped
+`wf-code-eval`, so the gate keeps working after a project's own copy of this skill is retired.
+In a project with no gate wired, every command below does nothing and exits 0.
+
+```bash
+WF="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/workforce"; [ -d "$WF" ] || WF="${CLAUDE_PROJECT_DIR}/.claude/skills/workforce"
+"$WF/bin/wf-code-eval" --active on     # at the START of every review
+"$WF/bin/wf-code-eval" --active off    # at the END, pass or fail
+"$WF/bin/wf-code-eval" --stamp         # only after a review that left no outstanding HIGH finding
+```
+
+1. **Loop guard.** Run `--active on` before the first read and `--active off` when the review
+   ends, whatever its outcome. While it is set the gate hooks skip, so this skill's own fixes do
+   not re-trigger them.
+2. **Stamp on a clean pass, and only then.** A review with any outstanding HIGH-tier finding does
+   not stamp. The stamp is the review's receipt; a stamp without a clean review is a forged one.
+   When the gate script carries its own `--stamp`, `wf-code-eval` asks the gate to stamp itself,
+   so the gate's own exclusions decide the hash.
+3. **Before-write direction.** If a before-write gate blocks, consult the `code-design-advisor`,
+   then `touch .claude/.code-eval-advised` and retry. A clean stamp clears it.
+
+`"$WF/bin/wf-code-eval"` with no flag lists the gates this project wires, and exits 1 if a
+registered gate's script is missing.
+
+## Grounding
+
+- [references/cross-file-detection.md](references/cross-file-detection.md) — detection procedure (read first)
+- [references/guards.md](references/guards.md) — the 20 false-positive guards (read before flagging anything dead)
+- [references/mistake-taxonomy.md](references/mistake-taxonomy.md) — what to look for
+- [references/native-tool-map.md](references/native-tool-map.md) — per-language tool preference
+- [references/gotchas.md](references/gotchas.md) — quick WRONG/CORRECT reminders

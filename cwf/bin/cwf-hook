@@ -69,6 +69,11 @@ def stop_event(raw):
     payload, env = cwf_codex.normalize_payload(raw)
     root = env["CWF_PROJECT_ROOT"]
     system = ""
+    if payload.get("cwf_unjudged"):
+        # A null transcript is a supported Codex state (`codex exec --ephemeral`), not a
+        # pass. There is nothing downstream can judge, so say that in the one channel the
+        # user sees and stop before a step mistakes an empty path for clean evidence.
+        return emit_ok("cwf: not judged — " + payload["cwf_unjudged"])
     if payload.get("cwf_reply_unmatched"):
         # Upstream judges nothing it cannot confirm, so say why this turn went unjudged.
         system = "cwf: the reply never appeared in the transcript; this turn was not judged"
@@ -88,8 +93,11 @@ def stop_event(raw):
     if widen.get("decision") == "block":
         return emit_block(widen.get("reason") or "", system)
 
-    if payload.get("stop_hook_active") or os.environ.get("CWF_JUROR", "on") == "off":
-        return emit_ok(system)
+    if payload.get("stop_hook_active"):
+        return emit_ok(_join(system, "cwf: not judged — a Stop continuation is not "
+                                     "independently judged"))
+    if os.environ.get("CWF_JUROR", "on") == "off":
+        return emit_ok(_join(system, "cwf: not judged — juror disabled (CWF_JUROR=off)"))
     # The scratch directory is already per session, and wf-widen raises its flag there
     # under wf-task-tag's own session_component name; find it rather than restate that rule.
     # Only the main session raises one (wf-widen `raise_flag` is reached only when not a
@@ -97,17 +105,28 @@ def stop_event(raw):
     import glob
     flags = sorted(glob.glob(os.path.join(payload["scratchpad_dir"], "wf-widen-flag.*.json")),
                    key=os.path.getmtime)
-    if not flags or raw.get("hook_event_name") == "SubagentStop":
-        return emit_ok(system)
+    if raw.get("hook_event_name") == "SubagentStop":
+        return emit_ok(_join(system, "cwf: not judged — SubagentStop has no independent "
+                                     "juror"))
+    if not flags:
+        return emit_ok(_join(system, "cwf: not judged — no widen flag, so no independent "
+                                     "verdict was produced"))
     flag = flags[-1]
     verdict, diag = cwf_juror.judge(payload, flag, root)
-    if diag:
+    if verdict is None:
+        system = _join(system, "cwf: not judged" + (f" — {diag}" if diag else ""))
+    elif diag:
         system = _join(system, f"cwf juror: {diag}")
     if isinstance(verdict, dict) and verdict.get("ok") is False:
         return emit_block("Agent hook condition was not met: " + str(verdict.get("reason") or ""),
                           system)
-    if isinstance(verdict, dict) and verdict.get("notes"):
-        system = _join(system, "juror notes: " + "; ".join(str(n) for n in verdict["notes"]))
+    if isinstance(verdict, dict):
+        # A real verdict must be visible, not only a block. A silent ok leaves the user
+        # unable to tell a juror that checked from one that never ran.
+        reason = str(verdict.get("reason") or "").strip()
+        system = _join(system, "cwf juror: " + (reason or "ok (no reason given)"))
+        if verdict.get("notes"):
+            system = _join(system, "juror notes: " + "; ".join(str(n) for n in verdict["notes"]))
     return emit_ok(system)
 
 

@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""wf-text-scan — text-eval's Tier 1 character pass, run by a script instead of remembered.
+
+    wf-text-scan [--root DIR] <file>...     scan each file
+    wf-text-scan [--root DIR] -             scan standard input
+
+Exit 0: no MUST FIX row. Exit 1: at least one MUST FIX row (a [hard] row over its threshold,
+or a row a house rule elevated). Exit 2: usage error, or an input that could not be read.
+
+WHY THIS EXISTS. User, 2026-11-10: *"the reason that is there was to remove the constant use of
+certain characters like em-dashes, since the ai uses them as sort of a watermark for
+communication style ... We need to find some way of integrating the problem characters there."*
+`references/text-tells.md` § Tier 1 *Character & punctuation* already catalogs those characters,
+and text-eval shipped no script, so that tier ran only when the evaluating model remembered to
+grep. The separate `character-scanner` agent that once covered it was never called by text-eval's
+own SKILL.md, and it is removed in the same change that adds this. The scan is now the first step
+of every evaluation, and its output is EVIDENCE for the judgment pass: it never rewrites the text.
+
+WHAT IT READS, row by row (`text-tells.md` § Tier 1):
+  - Em-/en-dash as crutch [hard]: every occurrence with its line and quoted phrase, the rate per
+    5,000 words, and MUST FIX on any dash past the allowance inside a ~5,000-word window (catalog:
+    1, so the SECOND within ~5,000 words is MUST FIX). An en-dash between two digits is a range,
+    not a connector, and is counted apart.
+  - Rhetorical colons (judgment): candidates, after the catalog's exclusions (list
+    introductions, URLs, timestamps, dialogue attribution, footnote syntax) and markdown syntax.
+    A candidate is not a finding until the judgment pass reads it.
+  - Invisible Unicode [hard]: clustered by class, scanned over the WHOLE file, code included,
+    because a bidi control hidden in code is the Trojan Source case the row names.
+  - Curly/straight quote seams (judgment): counts of each form and where each occurs.
+Frontmatter, fenced code blocks, inline code, HTML comments and URLs are not prose and are not
+read by the dash, colon or quote checks.
+
+HOUSE RULES ARE STRUCTURE, NEVER A PROSE GREP (`references/evaluators.md` § The supersession
+register). A project tightens a row with a `text-scan:` attribute on an `origin: user` marker in
+`<root>/.agents/skills/cwf-text-eval/CATALOG-ANCHOR.md`, the file text-eval's step 6 already reads:
+
+    <!-- origin: user | added: 2026-11-10 | text-scan: em-dash=0; rhetorical-colon=hard -->
+
+`em-dash=N` is the allowance per ~5,000 words (0: every dash is MUST FIX). `rhetorical-colon=hard`
+makes every candidate MUST FIX, still to be confirmed as rhetorical by the judgment pass. A house
+rule can only TIGHTEN here. Loosening is a demotion, and the supersession register is the sole
+authority for one, so `em-dash=2` is reported and ignored. The machine-owned `WF-HOUSE-RULES`
+region is never read for this: it is replaced on every audit. A rule written only in prose is
+the judgment pass's to apply, and it can raise what this prints, never lower it.
+
+PYTHON-FLOOR 3.6 (`platform.md` § header).
+"""
+
+import argparse
+import os
+import re
+import sys
+
+WINDOW = 5000           # words — the catalog's "~5,000 words"
+CATALOG_ALLOWANCE = 1   # "Target <=1 em-dash per ~5,000 words"
+
+INVISIBLE = (
+    ("zero-width", re.compile("[\u200b\u200c\u200d\u2060\ufeff]")),
+    ("narrow-nbsp", re.compile("\u202f")),
+    ("bidi-control", re.compile("[\u202a-\u202e\u2066-\u2069]")),
+    ("tag-block", re.compile("[\U000e0000-\U000e007f]")),
+    ("private-use", re.compile("[\ue000-\uf8ff]")),
+)
+
+FENCE_RX = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+INLINE_CODE_RX = re.compile(r"(`+)(?:(?!\1).)+?\1")
+URL_RX = re.compile(r"(?:\b[A-Za-z][A-Za-z0-9+.-]*://|\bmailto:|\bwww\.)[^\s<>()\[\]]+")
+LINK_TARGET_RX = re.compile(r"\]\([^)]*\)")
+AUTOLINK_RX = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^>\s]*>")
+IMAGE_RX = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+WORD_RX = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)*")
+TABLE_RULE_RX = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+FOOTNOTE_DEF_RX = re.compile(r"^\s*\[[^\]]+\]:")
+SPEAKER_RX = re.compile(r"^\s*[A-Z][A-Z0-9 .'\u2019-]{0,30}:")
+SHORTCODE_RX = re.compile(r":[a-z0-9_+-]+:")
+
+HOUSE_FILE = os.path.join(".agents", "skills", "cwf-text-eval", "CATALOG-ANCHOR.md")
+HOUSE_REGION_RX = re.compile(
+    r"^<!--\s*WF-HOUSE-RULES\s+START\b[^>]*-->.*?^<!--\s*WF-HOUSE-RULES\s+END\s*-->[ \t]*$",
+    re.M | re.S)
+COMMENT_RX = re.compile(r"<!--(.*?)-->", re.S)
+# The marker attribute grammar `wf-catalog` reads (`HOUSE_ATTR_RX`): `key: value | key: value`.
+ATTR_RX = re.compile(r"\b([A-Za-z][A-Za-z-]*):\s*([^|>]*?)\s*(?=\||-->|$)")
+
+
+def mask(text, rx):
+    """`text` with every match of `rx` blanked to spaces, so columns and lengths survive."""
+    return rx.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def house_rules(root):
+    """`(path, rules, sources, notes)`: the tightening directives a project's house rules carry.
+
+    `notes` is None when the file is absent, so "no house rules" and "house rules with no
+    directive" never print the same line.
+    """
+    path = os.path.join(root, HOUSE_FILE)
+    rules = {"em-dash": CATALOG_ALLOWANCE, "rhetorical-colon": "judgment"}
+    notes, src = [], {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return path, rules, src, None
+    text = HOUSE_REGION_RX.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    for m in COMMENT_RX.finditer(text):
+        attrs = {k.lower(): v for k, v in ATTR_RX.findall(m.group(1))}
+        if attrs.get("origin", "").strip().lower() != "user" or "text-scan" not in attrs:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        for part in re.split(r"[;,]", attrs["text-scan"]):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, val = part.partition("=")
+            key, val = key.strip().lower(), val.strip().lower()
+            where = "line %d" % line
+            if key == "em-dash" and val.isdigit():
+                if int(val) > CATALOG_ALLOWANCE:
+                    notes.append("ignored em-dash=%s (%s): a looser allowance is a demotion, and "
+                                 "only the supersession register grants one" % (val, where))
+                elif int(val) < rules["em-dash"]:
+                    rules["em-dash"], src["em-dash"] = int(val), where
+            elif key == "rhetorical-colon" and val in ("hard", "judgment"):
+                if val == "hard":
+                    rules["rhetorical-colon"], src["rhetorical-colon"] = "hard", where
+            else:
+                notes.append("ignored %r (%s): not a key=value this scan reads "
+                             "(em-dash=<0|1>, rhetorical-colon=hard)" % (part, where))
+    return path, rules, src, notes
+
+
+def prose_lines(lines):
+    """`(prose, skipped)`: each line blanked where it is not prose, and what was skipped."""
+    out, fm, fences = list(lines), None, 0
+    start = 1 if lines and lines[0].lstrip("\ufeff").strip() == "---" else None
+    if start is not None:
+        for i in range(1, len(lines)):
+            if lines[i].strip() in ("---", "..."):
+                fm = (1, i + 1)
+                for j in range(0, i + 1):
+                    out[j] = ""
+                break
+    fence, in_comment = None, False
+    for i, line in enumerate(lines):
+        if fm and i < fm[1]:
+            continue
+        if fence:
+            m = FENCE_RX.match(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not line.strip()[len(m.group(1)):].strip():
+                fence = None
+            out[i] = ""
+            continue
+        m = FENCE_RX.match(line)
+        if m:
+            fence, fences = m.group(1), fences + 1
+            out[i] = ""
+            continue
+        # HTML comments, possibly spanning lines — markers, never prose.
+        text, pos, kept = line, 0, []
+        while pos <= len(text):
+            if in_comment:
+                end = text.find("-->", pos)
+                if end < 0:
+                    kept.append(" " * (len(text) - pos))
+                    pos = len(text) + 1
+                    break
+                kept.append(" " * (end + 3 - pos))
+                pos, in_comment = end + 3, False
+            else:
+                begin = text.find("<!--", pos)
+                if begin < 0:
+                    kept.append(text[pos:])
+                    break
+                kept.append(text[pos:begin])
+                pos, in_comment = begin, True
+        text = "".join(kept)
+        for rx in (INLINE_CODE_RX, IMAGE_RX, AUTOLINK_RX, LINK_TARGET_RX, URL_RX):
+            text = mask(text, rx)
+        out[i] = text
+    return out, fm, fences
+
+
+def phrase(line, col, width=34):
+    """The phrase around column `col`, cut at word boundaries."""
+    a, b = max(0, col - width), min(len(line), col + width)
+    while a > 0 and not line[a - 1].isspace():
+        a -= 1
+    while b < len(line) and not line[b].isspace():
+        b += 1
+    s = " ".join(line[a:b].split())
+    return ("..." if a > 0 else "") + s + ("..." if b < len(line) else "")
+
+
+def colon_exclusion(line, col):
+    """Why the colon at `col` is mechanical, or None for a rhetorical candidate."""
+    before, after = line[:col], line[col + 1:]
+    if not after.strip(" \t*_"):
+        return "list intro / label at line end"
+    if col > 0 and before[-1].isdigit() and after[:1].isdigit():
+        return "timestamp / ratio"
+    if FOOTNOTE_DEF_RX.match(line) and col == line.index("]:") + 1:
+        return "footnote / reference syntax"
+    if re.match(r"\s*[\"\u201c'\u2018>]", after):
+        return "dialogue / quote attribution"
+    m = SPEAKER_RX.match(line)
+    if m and col == m.end() - 1 and any(c.isalpha() for c in m.group(0)):
+        return "dialogue attribution (speaker label)"
+    if col > 0 and before[-1].isalpha() and after[:1] == "\\":
+        return "path"
+    for s in SHORTCODE_RX.finditer(line):
+        if s.start() == col or s.end() - 1 == col:
+            return "emoji shortcode"
+    return None
+
+
+def lines_of(nums, cap=8):
+    nums = sorted(set(nums))
+    shown = ", ".join(str(n) for n in nums[:cap])
+    return shown + (", +%d more" % (len(nums) - cap) if len(nums) > cap else "")
+
+
+def scan(name, text, rules, src):
+    """Print the report for one input; return 1 when a MUST FIX row fires, else 0."""
+    lines = text.split("\n")
+    prose, fm, fences = prose_lines(lines)
+    must = 0
+
+    # Word offsets, so the dash window counts words and not characters.
+    offsets, total = [], 0
+    for p in prose:
+        offsets.append(total)
+        if not TABLE_RULE_RX.match(p):
+            total += len(WORD_RX.findall(p))
+
+    skipped = []
+    if fm:
+        skipped.append("frontmatter lines %d-%d" % fm)
+    if fences:
+        skipped.append("%d fenced code block(s)" % fences)
+    print("wf-text-scan: %s (%d words of prose%s)"
+          % (name, total, "; skipped " + ", ".join(skipped) if skipped else ""))
+
+    # ── Em-/en-dash as crutch [hard] ──
+    dashes, ranges = [], 0
+    for i, p in enumerate(prose):
+        for m in re.finditer("[\u2014\u2013]", p):
+            c = m.start()
+            if m.group(0) == "\u2013" and re.search(r"\d\s?$", p[:c]) and re.match(r"\s?\d", p[c + 1:]):
+                ranges += 1
+                continue
+            dashes.append((offsets[i] + len(WORD_RX.findall(p[:c])), i + 1, c, m.group(0)))
+    allow = rules["em-dash"]
+    basis = "house rule, %s" % src["em-dash"] if "em-dash" in src else "catalog"
+    over = []
+    for k, (pos, ln, c, ch) in enumerate(dashes):
+        in_window = sum(1 for d in dashes[:k + 1] if pos - d[0] < WINDOW)
+        over.append(in_window > allow)
+    rate = len(dashes) * float(WINDOW) / total if total else float(len(dashes))
+    head = "[hard] Em-/en-dash as crutch: "
+    if not dashes:
+        print(head + "0 found")
+    else:
+        verdict = "MUST FIX" if any(over) else "flagged, within allowance"
+        print(head + "%s - %d found, %.1f per 5,000 words (allowance %d per ~5,000 words, %s)"
+              % (verdict, len(dashes), rate, allow, basis))
+        for (pos, ln, c, ch), o in zip(dashes, over):
+            print("  L%-7s %-9s %s  \"%s\"" % ("%d:%d" % (ln, c + 1), "MUST FIX" if o else "flag",
+                                             "em-dash" if ch == "\u2014" else "en-dash",
+                                             phrase(lines[ln - 1], c)))
+        must |= any(over)
+    if ranges:
+        print("  (%d en-dash numeric range(s) not counted)" % ranges)
+
+    # ── Rhetorical colons (judgment; a house rule may make it hard) ──
+    cands, excluded = [], {}
+    for i, p in enumerate(prose):
+        if TABLE_RULE_RX.match(p):
+            continue
+        for m in re.finditer(":", p):
+            why = colon_exclusion(p, m.start())
+            if why:
+                excluded[why] = excluded.get(why, 0) + 1
+            else:
+                cands.append((i + 1, m.start()))
+    hard = rules["rhetorical-colon"] == "hard"
+    head = "Rhetorical colons: "
+    if hard:
+        head = "[hard, house rule %s] Rhetorical colons: " % src["rhetorical-colon"]
+    if not cands:
+        print(head + "0 candidates")
+    elif hard:
+        print(head + "MUST FIX - %d candidate(s); confirm each is rhetorical, a mechanical colon "
+              "the scan could not exclude is not a finding" % len(cands))
+    else:
+        print(head + "%d candidate(s) for the judgment pass (counts toward the passage's cluster)"
+              % len(cands))
+    for ln, c in cands:
+        print("  L%-7s %-9s \"%s\"" % ("%d:%d" % (ln, c + 1), "MUST FIX" if hard else "candidate",
+                                       phrase(lines[ln - 1], c)))
+    if excluded:
+        print("  excluded: " + ", ".join("%s %d" % (k, v) for k, v in sorted(excluded.items())))
+    must |= hard and bool(cands)
+
+    # ── Invisible Unicode [hard] — the whole file, code included ──
+    found = []
+    for cls, rx in INVISIBLE:
+        cps, where = {}, []
+        for i, line in enumerate(lines):
+            for m in rx.finditer(line):
+                cp = "U+%04X" % ord(m.group(0))
+                cps[cp] = cps.get(cp, 0) + 1
+                where.append(i + 1)
+        if cps:
+            found.append((cls, cps, where))
+    head = "[hard] Invisible Unicode: "
+    if not found:
+        print(head + "0 codepoints")
+    else:
+        n = sum(sum(c.values()) for _, c, _ in found)
+        print(head + "MUST FIX - %d codepoint(s) in %d class(es)" % (n, len(found)))
+        for cls, cps, where in found:
+            print("  %s: %d (%s) on line(s) %s"
+                  % (cls, sum(cps.values()),
+                     ", ".join("%s: %d" % kv for kv in sorted(cps.items())), lines_of(where)))
+        must = 1
+
+    # ── Curly/straight quote seams (judgment) ──
+    forms = (("double", "\u201c\u201d", '"'), ("single", "\u2018\u2019", "'"))
+    seams = []
+    for kind, curly, straight in forms:
+        cl = [i + 1 for i, p in enumerate(prose) if any(ch in p for ch in curly)]
+        sl = [i + 1 for i, p in enumerate(prose) if straight in p]
+        if cl and sl:
+            seams.append("%s: curly on line(s) %s; straight on line(s) %s"
+                         % (kind, lines_of(cl), lines_of(sl)))
+    if seams:
+        print("Curly/straight quote seams: %d kind(s) mixed (judgment row)" % len(seams))
+        for s in seams:
+            print("  " + s)
+    else:
+        print("Curly/straight quote seams: none")
+
+    # ── No catalog row: evidence only ──
+    other = []
+    for label, ch in (("ellipsis character U+2026", "\u2026"), ("no-break space U+00A0", "\u00a0")):
+        ls = [i + 1 for i, p in enumerate(prose) if ch in p]
+        if ls:
+            other.append("%s on line(s) %s" % (label, lines_of(ls)))
+    if other:
+        print("Other characters (no catalog row, evidence only): " + "; ".join(other))
+
+    print("Result: %s. Evidence for the judgment pass, never a rewrite."
+          % ("MUST FIX" if must else "no MUST FIX row"))
+    return 1 if must else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--root", default=os.environ.get("CWF_PROJECT_DIR") or os.getcwd(),
+                    help="project root whose .agents/skills/cwf-text-eval/CATALOG-ANCHOR.md "
+                         "carries the house rules (default: $CWF_PROJECT_DIR, else cwd)")
+    ap.add_argument("inputs", nargs="+", metavar="FILE", help="a file, or - for standard input")
+    args = ap.parse_args(argv)
+
+    path, rules, src, notes = house_rules(args.root)
+    if notes is None:
+        print("House rules: none (%s absent); catalog defaults apply" % path)
+    elif src:
+        print("House rules: %s: %s" % (path, ", ".join(
+            "%s=%s (%s)" % (k, rules[k], src[k]) for k in sorted(src))))
+    else:
+        print("House rules: %s carries no text-scan directive; catalog defaults apply" % path)
+    for n in notes or ():
+        print("  " + n)
+
+    rc = 0
+    for name in args.inputs:
+        print("")
+        try:
+            if name == "-":
+                data = sys.stdin.buffer.read()
+                name = "<stdin>"
+            else:
+                with open(name, "rb") as fh:
+                    data = fh.read()
+            text = data.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print("wf-text-scan: %s: UNREADABLE (%s)" % (name, e))
+            rc = 2
+            continue
+        rc = max(rc, scan(name, text.replace("\r\n", "\n"), rules, src))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

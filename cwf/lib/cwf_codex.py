@@ -8,8 +8,9 @@ replaces only the Claude-specific edges around it, as agreed with cw-dev (2026-1
   transcript      Codex rollout JSONL is rewritten into Claude-shaped JSONL, so the
                   upstream walkers (`TL._read_lines`, `current_turn`, `turn_rows`,
                   `confirmed_reply`) run unchanged.
-  paths           `issues_dir` and widen's `instruments` are patched on every load of the
-                  upstream modules (see `install_patches`). Nothing writes under `.claude/`.
+  paths           `issues_dir`, widen's PERF/handoff directories and its `instruments`
+                  are patched on every load of the upstream modules (see `install_patches`).
+                  Nothing writes under `.claude/`.
   output          Stop blocks carry a "Stop hook feedback:" prefix, because Codex replays
                   a block's reason as a new user prompt and wf-task-tag's INJECTED rule
                   must recognise it as injected, not as the user's words.
@@ -32,15 +33,71 @@ INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<perm
                      "<skills_instructions>", "<collaboration_mode>", "<user_instructions>")
 FEEDBACK_PREFIX = "Stop hook feedback:\n"
 
+# Injected text is upstream's Claude Code wording. These replacements are applied to the
+# loaded module constants, never to upstream on disk, so the files stay checksum-pinned.
+CODEX_USER_WORDS = (
+    "What this user wants is decided by the user's own requests and notes, weighed by date "
+    "with the newest first: this message, then earlier messages in this conversation, then "
+    "older requests and notes. A report, plan, summary, or record written by an AI is an "
+    "interpretation of those words, not the user's evidence, however recent it is; projects "
+    "mark the difference with quoted user words, `origin: user` blocks, `source: user` "
+    "attributions, and the user's own notes. An older decision that a newer request "
+    "contradicts is superseded by the request, so \"keep it as it was\" is not one of the "
+    "choices, and an option that delivers less than the request is not the recommended one. "
+    "On how code is written, precedence runs: the user's newest requests and notes decide "
+    "what gets built; the project's original human-written code decides how, newest first "
+    "within it; AI-written code already in the project comes next, even when it is newer "
+    "than the human code; the AI's own preferences come last. Precedent covers mechanisms, "
+    "helpers, error handling, naming, and comment style, not bugs. Where a project has "
+    "almost no human code, the user's own words are its human precedent. Before an edit, "
+    "read the file's git blame or git log to see which lines are human, AI, or unknown."
+)
+CODEX_CHOOSER_RULE = (
+    "Stopping to ask this user is for a decision that genuinely needs them: anything that "
+    "can be decided and reversed is decided, said in one line, and the work it unblocks is "
+    "finished rather than reported as pending. Codex has no question tool, so when a "
+    "decision does need the user, ask one concise plain-text question in that same turn, "
+    "give the options and your recommendation, and stop there rather than continuing work "
+    "that depends on the answer. Plain text is the whole channel on this host."
+)
+CODEX_CLEANUP_RULE = (
+    "One-shot work is spawned as a plain subagent by preference: a named teammate can "
+    "outlive its own hand-back until something closes it, so an order reported done still "
+    "shows a running agent. Close a spawned agent with `close_agent` once its report has "
+    "been read. A work order names only tools the agent actually holds in this session; "
+    "Codex cannot enforce a per-agent tool allowlist, so check the order against the "
+    "tools the session exposes, and an order naming a tool the runner lacks is answered by "
+    "saying so in the report and doing the work with what is there. Before a package is run "
+    "through npx, what that name resolves to is known: the project's own package, a pinned "
+    "dependency, or a package the task names. A package name is never guessed from a tool's "
+    "or a project's name, and an MCP server is reached through its tools rather than started "
+    "from the shell. A command that might wait on input or on the network is worth wrapping "
+    "in `timeout`, and no background shell or process is left running once the work is done. "
+    "A wait on a long job polls the job's own progress, prints it, and carries a timeout, "
+    "with one waiter at a time; the job's own queue or the Monitor tool is preferred over a "
+    "sleep loop."
+)
+
 # Codex tool names -> the Claude names the upstream evidence counters understand.
 TOOL_MAP = {
     "exec_command": "Bash",
     "shell": "Bash",
     "local_shell": "Bash",
     "apply_patch": "Edit",
+    "edit_file": "Edit",
+    "write_file": "Write",
+    "read_file": "Read",
+    "list_dir": "Glob",
+    "search_files": "Grep",
     "web_search": "WebSearch",
     "web_search_call": "WebSearch",
+    "web_fetch": "WebFetch",
     "spawn_agent": "Agent",
+    "wait_agent": "Agent",
+    "close_agent": "Agent",
+    # A poll carries no new evidence: the exec_command that opened the session was
+    # already counted. It is mapped to the same read counter so it is never unknown.
+    "write_stdin": "Read",
     "view_image": "Read",
 }
 
@@ -220,11 +277,11 @@ def convert_rollout(src, dst, sidechain=False):
             body = p.get("output")
             if not isinstance(body, str):
                 body = json.dumps(body)
+            call_id = p.get("call_id") or p.get("id")
+            result = {"type": "tool_result", "tool_use_id": call_id, "content": body}
             out.append({"type": "user", "timestamp": ts,
                         "toolUseResult": {"stdout": _stdout(body), "stderr": ""},
-                        "message": {"role": "user", "content": [{
-                            "type": "tool_result", "tool_use_id": p.get("call_id") or p.get("id"),
-                            "content": body}]}})
+                        "message": {"role": "user", "content": [result]}})
         elif t.endswith("_call"):
             name = p.get("name") or t
             mapped, args = _tool_input(name, p.get("arguments", p.get("input", p.get("action"))))
@@ -312,7 +369,8 @@ def resume_context(root, payload):
 
 def normalize_payload(payload):
     """Codex hook input -> the payload the upstream hooks expect. Returns (payload, env).
-    Sets `cwf_reply_unmatched` when a Stop's reply never appeared in the transcript."""
+    Sets `cwf_reply_unmatched` when a Stop's reply never appeared in the transcript, and
+    `cwf_unjudged` when a Stop has no transcript at all."""
     p = dict(payload)
     cwd = p.get("cwd") or os.getcwd()
     root = project_root(cwd)
@@ -322,6 +380,16 @@ def normalize_payload(payload):
     p["cwf_resume_context"] = resume_context(root, p)
     p["cwf_rollout_path"] = p.get("transcript_path")
     stopping = str(p.get("hook_event_name", "")).endswith("Stop")
+    if stopping:
+        missing = []
+        if not (isinstance(p.get("transcript_path"), str) and p.get("transcript_path")):
+            missing.append("transcript_path")
+        if p.get("hook_event_name") == "SubagentStop" and not (
+                isinstance(p.get("agent_transcript_path"), str) and p.get("agent_transcript_path")):
+            missing.append("agent_transcript_path")
+        if missing:
+            p["cwf_unjudged"] = ("Codex sent null " + " and ".join(missing)
+                                 + "; this stop has no transcript to judge")
     for key, name in (("transcript_path", "transcript.jsonl"),
                       ("agent_transcript_path", f"agent-{_safe(p.get('agent_id'))}.jsonl")):
         src = p.get(key)
@@ -395,11 +463,44 @@ def _instruments(cwd):
     return found
 
 
+def _perf_store(module, root):
+    """Upstream's personnel-store rule with the Codex state directory."""
+    if not root:
+        return ""
+    d = os.path.join(root, *module.PERF_STORE_PARTS)
+    if os.path.islink(d) or os.path.islink(os.path.dirname(d)):
+        return ""
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return ""
+    return d
+
+
 def _patch(module):
     if hasattr(module, "issues_dir") and hasattr(module, "ISSUES") and hasattr(module, "project_root"):
         module.issues_dir = lambda payload, create=False, _m=module: _issues_dir(_m, payload, create)
     if hasattr(module, "instruments") and hasattr(module, "turn_rows"):
         module.instruments = _instruments
+    # F01: upstream's cap-hit PERF store and handoff lookup still name `.claude/`.
+    if hasattr(module, "PERF_STORE_PARTS"):
+        module.PERF_STORE_PARTS = (STATE_DIRNAME, "personnel")
+        module.PERF_STORE = os.path.join(*module.PERF_STORE_PARTS)
+        if hasattr(module, "perf_store"):
+            # Rebind the function too: it closes over the module global, so patching the
+            # constant is enough in this process, but an explicit function makes the path
+            # assertion unambiguous to a reader.
+            module.perf_store = lambda root, _m=module: _perf_store(_m, root)
+    if hasattr(module, "WORK_DIRS"):
+        module.WORK_DIRS = (STATE_DIRNAME, "work")
+    # F08/F25: the injected wording names Claude-only tools. Patch the live constants so
+    # every load, including a sibling's own copy, speaks the Codex surface.
+    if hasattr(module, "USER_WORDS"):
+        module.USER_WORDS = CODEX_USER_WORDS
+    if hasattr(module, "CHOOSER_RULE"):
+        module.CHOOSER_RULE = CODEX_CHOOSER_RULE
+    if hasattr(module, "CLEANUP_RULE"):
+        module.CLEANUP_RULE = CODEX_CLEANUP_RULE
 
 
 def install_patches():

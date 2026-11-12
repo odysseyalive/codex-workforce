@@ -3803,7 +3803,7 @@ def ledger_verdict(payload, decided):
     # THIS TURN'S LIST LANDS ON ITS ISSUE AT ITS OWN STOP, title and continuations included,
     # rather than at the next message: an issue's items and title were one turn behind.
     # Gated exactly like `track_message` below: a side query is mid-turn, before the list is
-    # finished, and absorbing a half-written list could fold this issue on a partial view.
+    # finished, and absorbing a half-written list would record this issue on a partial view.
     if (isinstance(record, dict) and not record.get("carry_only") and record.get("issue")
             and not record.get("ended") and reply is not None):
         TT.absorb_items(led, record.get("issue"), TT.checklist_items(cl), TT.checklist_title(cl))

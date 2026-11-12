@@ -1,6 +1,7 @@
 # Resume: Codex-only workforce after the Crush cut
 
-Status: ACTIVE handoff, 2026-11-11. Delete or replace this file when the next action is done.
+Status: COMPLETE handoff, 2026-11-12. The 0.1.2 package passed its live-Codex smoke test;
+delete or replace this file when the release commit is made.
 This file is tracked. The trusted `cwf-hook prompt` injects it on the first main-session prompt;
 it is not injected into subagents or Stop-feedback continuations.
 
@@ -8,26 +9,67 @@ it is not injected into subagents or Stop-feedback continuations.
 
 - Repo: `/home/francis/lab/codex-workforce`
 - HEAD: run `git log -1 --oneline`; this file deliberately does not repeat its own commit hash.
-  The resume mechanism arrived in `d3238f9`, the Crush cut is `cfa640b`, and the live-hook
-  status is recorded at `2f7c55f`.
-- VERSION: `0.1.1`
-- Tests: `python3 -m unittest discover -s tests -v` — 33 tests, OK.
-- Live hook status: prompt, SubagentStart, Stop and SubagentStop have all fired in this
-  repository. The resume handoff is injected by the prompt hook; no new hook event was added.
+- VERSION: `0.1.2`
+- Tests: `python3 -m unittest discover -s tests -v` — 46 tests, OK.
 - Supported host: **Codex only**. Crush compatibility was cut by the user on 2026-11-11.
-  The Crush probing stays as historical evidence, not a product target.
+- Upstream pin: `52cdfe7e4d61d4b82d5d6cbd7c673f684eec3a86`. The full `workforce/skills/`
+  tree and the `workforce/agents/` handbooks are copied, so all generated artifacts are
+  reproducible. The pin also covers the later YAML fix and the work-list fix.
 
-## What changed in this session
+## What changed in the Codex-only port
 
-- `cfa640b`: Codex is the only supported host; Crush is historical discovery evidence.
-  `CHANGELOG.md` records the cut. `scripts/build-skills` describes a Codex skill generator.
-  `.gitignore` and `tests/test_senses.py` ignore/cover `.crushrc` and `crushrc`.
-- `d3238f9` adds the tracked `RESUME.md` and injects it through the existing trusted prompt
-  hook. It does not add a new hook event, so no re-trust is needed for this change.
+- Widen's PERF store and handoff lookup are patched to `.codex-workforce/`; a regression
+  test exercises both consumers, not only the constants.
+- `web_fetch`, `wait_agent`, `close_agent` and `write_stdin` map to known counters. The
+  adapter's tool table is tested against every measured Codex tool.
+- A null transcript (`codex exec --ephemeral`) and a disabled/missing juror now say
+  "not judged" instead of silently passing.
+- The injected `AskUserQuestion` and `shutdown_request` wording is replaced at module load
+  with a Codex plain-text question rule and `close_agent` close-out.
+- All eight upstream skills ship as `cwf-*` copies with `$cwf-<name>` invocation, Codex
+  paths, and the same generated-file checksum in `manifest.txt`. Nine custom-agent TOMLs are
+  generated under `cwf/agents/` with host limits stated explicitly. The three scripts those
+  skills call (`wf-code-eval`, `wf-map`, `wf-census`) are generated into `cwf/bin/` so the
+  documented commands resolve after install.
 
-Decision record: the user chose to **keep the existing shared link** and its versions 1–4,
-rather than delete the artifact and republish at a new URL. Version 5 is the current page and
-contains zero Crush mentions. Do not reopen the URL question unless the user does.
+## Live smoke test: passed 2026-11-12
+
+- Installed the package into an isolated git project with the local `install --project`
+  path, then spawned `code-design-advisor` as a real custom-agent type. The child returned
+  `CUSTOM_AGENT_LIVE_7Q`; the parent waited, closed it, and returned `PARENT_SAW_LIVE_CUSTOM`.
+  The agent transcript carries the generated handbook text, so the TOML was loaded by type.
+- Loaded `cwf-records-code-map` by its `$cwf-` name and got `SKILL_OK
+  cwf-records-code-map Records — Code Map`.
+- Ran a flagged Stop. Widen sampled the work turn, the read-only juror returned a real `ok`
+  with a transcript citation, and direct `cwf_juror.judge` on the same payload returned the
+  same verdict through the installed copy. The hook had previously dropped an `ok` verdict
+  unless it carried notes; that silent pass is now fixed and pinned by
+  `test_real_juror_ok_is_visible_not_a_silent_pass`.
+- The skill-script smoke test now starts `wf-code-eval` and `wf-map` from the package and
+  confirms both use Codex state paths.
+
+## Verification before commit
+
+- `python3 -m unittest discover -s tests -v`: 46 tests, OK, after the generated-skill script
+  copies and the visible-verdict fix.
+- `git diff --check`: clean.
+- `scripts/build-skills`: 8 skills + 9 custom-agent TOMLs + 3 skill scripts generated and
+  validated.
+
+## What was verified
+
+- `python3 -m unittest discover -s tests -v`: 46 tests, OK. The suite covers prompt tagging,
+  Stop block + continuation, normal and null subagent stops, cap-hit PERF, web-only research,
+  generated metadata, generated skill scripts, install/update/uninstall, and upstream
+  checksum pinning.
+- `scripts/build-skills`: 8 skills + 9 custom-agent TOMLs generated and validated with
+  PyYAML and `tomllib`. The TOMLs omit Claude model pins and state the lost tool
+  enforcement in every instruction body.
+- Both installers place the nine TOMLs in `.codex/agents/`; personal and project install
+  tests pass. Uninstall removes only recorded agents and refuses traversal. The generated
+  `wf-text-scan` and `wf-timezone` entry points both start and print usage.
+- Widen's PERF producer, handoff lookup, web-only `web_fetch` evidence path and null
+  transcript state all have regression coverage.
 
 ## Shared artifact
 
@@ -82,21 +124,8 @@ The project’s own gates pass: `bin/conformance` 85/85, `bin/idempotence` 14/14
 
 ## Next actions, in order
 
-1. **Fix the two false-clean checks in claude-workforce.** Use one real YAML parse helper for
-   `AGENT.md` and `SKILL.md` in both `wf-conform` and `bin/baseline`; retain the parse error
-   in the quarantine/detail. Add fixtures that must fail on malformed YAML. This is a
-   claude-workforce change, not a codex-workforce change.
-2. **Restore or replace the version enforcement.** Either make the pre-commit hook
-   reachable and include every manifest flag, or remove the claim and give the surviving
-   conformance path an actual anchor/mirror check. Add a negative test.
-3. **Apply the Codex-only port plan from `FINDINGS.md`:** fix the two `.claude` paths
-   (`F01`) and the tool map (`F02`), correct AGENTS.md’s live-hook status, generate all eight
-   skills, replace Claude-only injected wording, and surface “not judged” instead of a silent
-   pass. None of that is committed yet.
-4. Re-run `python3 -m unittest discover -s tests -v` in `codex-workforce` after any package
-   change, and the claude-workforce gates after any change there.
-5. If the artifact changes, send cw-dev a new markdown source path and ask for the **same
-   URL**. Do not use the old Crush-inclusive `CRUSH-EVIDENCE.md` for that.
+1. Commit the 0.1.2 package.
+2. Delete or replace this file before the next session; its work is done.
 
 ## External state and cautions
 
@@ -119,5 +148,5 @@ The project’s own gates pass: `bin/conformance` 85/85, `bin/idempotence` 14/14
 ## Session close-out
 
 No subagent is still running. The review agent was closed after its report was read. The
-package is committed; the local audit artifacts are under `.codex-workforce/` and are
-intentionally git-ignored.
+0.1.2 package is ready to commit; the local audit artifacts are under `.codex-workforce/`
+and are intentionally git-ignored.

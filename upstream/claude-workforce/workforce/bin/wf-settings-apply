@@ -77,8 +77,8 @@ PROJECT_SETTINGS = ("settings.local.json", "settings.json")
 
 def _sibling(name):
     """A sibling shipped script, imported by path. The ONE loader in this file, and it
-    leaves no bytecode behind in the shipped bin/ (bin/check reports a __pycache__
-    there as an undeclared file)."""
+    leaves no bytecode behind in the shipped bin/ (bin/check reported a __pycache__
+    there as an undeclared file until it was retired on 2026-10-14)."""
     import importlib.machinery
     import importlib.util
     prev = sys.dont_write_bytecode
@@ -435,9 +435,9 @@ DEFAULT_HOOKS = tuple(n for n in sorted(SHIPPED_HOOKS) if n not in OPT_IN_HOOKS)
 
 # RETIRED BY THE DISTRIBUTION, NEVER BY A MISSING FILE. A row is removable as dead only
 # when its script is named here: every script this repository has deleted from
-# workforce/bin/ and does not ship now. bin/check derives the same set from `git log`
-# and the manifest and fails when the two disagree, so a name cannot be retired here by
-# accident, and a currently shipped name can never be.
+# workforce/bin/ and does not ship now. bin/check derived the same set from `git log`
+# and the manifest and failed when the two disagreed, until it was retired on 2026-10-14. Nothing
+# keeps them in agreement now, so a name added here by accident is no longer caught.
 #
 # WHY A LIST AND NOT `os.path.exists`. "The file is not there right now" is also true on
 # a branch checked out without its vendored install, inside `bin/sync`'s delete-then-copy

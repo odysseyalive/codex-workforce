@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""wf-timezone — the time zone Claude Code shows times in, set in ONE settings key.
+
+    wf-timezone [--root DIR] show [--json]     the setting, this machine's zone, candidates
+    wf-timezone set <Area/City>                write env.TZ into USER settings
+    wf-timezone clear                          remove it again
+
+WHY THIS EXISTS. User request, 2026-10-20: *"When replaying back with a timestamp on jobs
+finished, it would be great to display this in the user's preferred timezone."* On a
+remote server whose clock is Etc/UTC, Claude Code printed `Worked for 2h 43m 47s · done
+7:55 PM`, and 7:55 PM was UTC. That clock is rendered by Claude Code itself, in its own
+process's zone, and Claude Code copies every settings file's `env` block onto its own
+process environment — so `env.TZ` in a settings file is the whole mechanism
+(`platform.md` § Fact 27, MEASURED on 2.1.302). Nothing in workforce renders a clock time
+of its own, so this one key is the entire fix.
+
+USER SCOPE, on purpose. A person's time zone is a fact about them, not about a project,
+so the key goes into `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` and reaches every
+project on the machine. A project settings file that sets `env.TZ` itself wins over it
+(project scopes outrank user scope), so `show` names any that do.
+
+THE EDIT IS CHARACTER-LEVEL. The file is the user's own and holds their own formatting,
+so it is never loaded and dumped: `set` inserts or replaces the one member's characters
+and `clear` cuts exactly those characters back out, using `wf-settings-apply`'s JSON
+span parser. `set` followed by `clear` gives back the file byte for byte. Every edit is
+re-parsed and must equal the intended settings before anything is written.
+
+OWNERSHIP. `set` records `env_added.TZ` in the user-scope reversal record
+(`<config>/workforce/.settings-owned.json`, the file `--wire-defaults --scope user`
+records into), BEFORE the edit, so it is known which value workforce wrote.
+`clear` removes the key whoever wrote it, because clearing is what the user asked for.
+
+A REFUSED WRITE. Claude Code's self-modification classifier may refuse an agent's write to
+a user settings file. The remedy is the user running this same script with the REPL `!`
+prefix — `show --json` prints the exact command as `set_command` so it never has to be
+assembled by hand.
+
+PYTHON-FLOOR 3.6 (`platform.md` § header): `zoneinfo` is used when present (3.9+) and the
+system zone database is read directly otherwise.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# THE SURGICAL JSON WRITER IS NOT REWRITTEN HERE. It lives in wf-settings-apply, which an
+# install puts at <skills-root>/workforce/bin beside this skill's <skills-root>/timezone;
+# in the source tree the same file is three levels up. Loaded without leaving bytecode.
+SETTINGS_APPLY_CANDIDATES = (
+    os.path.join(HERE, "..", "..", "workforce", "bin", "wf-settings-apply"),
+    os.path.join(HERE, "..", "..", "..", "bin", "wf-settings-apply"),
+)
+
+# Directories the system zone database lives in, used when `zoneinfo` is absent.
+DEFAULT_TZPATH = ("/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo",
+                  "/etc/zoneinfo")
+
+# Every spelling of plain UTC, so UTC is never offered twice under two names.
+UTC_NAMES = {"UTC", "Etc/UTC", "Etc/UCT", "UCT", "Universal", "Etc/Universal", "Zulu",
+             "Etc/Zulu", "Etc/GMT", "GMT", "Etc/Greenwich", "Greenwich", "GMT0", "Etc/GMT0",
+             "GMT+0", "GMT-0", "Etc/GMT+0", "Etc/GMT-0"}
+
+# The zones a commit-time guess may name, in tie-break order: one representative for each
+# distinct offset-and-daylight pattern people commonly live in. A guess picks the zone
+# whose offset matches the most of the user's commits AT EACH COMMIT'S OWN DATE, so a
+# summer commit at -0400 and a winter one at -0500 both count for America/New_York.
+HINT_ZONES = (
+    "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+    "America/Phoenix", "America/Anchorage", "Pacific/Honolulu", "America/Halifax",
+    "America/St_Johns", "America/Mexico_City", "America/Bogota", "America/Sao_Paulo",
+    "America/Argentina/Buenos_Aires", "America/Santiago", "Europe/London", "Europe/Paris",
+    "Europe/Athens", "Europe/Istanbul", "Europe/Moscow", "Africa/Lagos",
+    "Africa/Johannesburg", "Africa/Cairo", "Africa/Nairobi", "Asia/Dubai", "Asia/Tehran",
+    "Asia/Karachi", "Asia/Kolkata", "Asia/Kathmandu", "Asia/Dhaka", "Asia/Bangkok",
+    "Asia/Shanghai", "Asia/Tokyo", "Australia/Perth", "Australia/Darwin",
+    "Australia/Adelaide", "Australia/Brisbane", "Australia/Sydney", "Pacific/Auckland",
+)
+
+# Used only to reach the two options a picker needs when nothing else is known, and
+# labelled as a common choice, never as a guess about the user.
+COMMON_ZONES = ("America/New_York", "Europe/London", "Asia/Tokyo")
+
+COMMITS_READ = 200
+
+# `git log` in a repository somebody else wrote: repository-local config can name an
+# executable (`core.fsmonitor`, `core.hooksPath`, and a signature program behind
+# `log.showSignature`), so each is overridden on the command line.
+GIT = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+       "-c", "log.showSignature=false"]
+
+NAME_SHAPE = re.compile(r"^[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)*$")
+
+RESTART_NOTE = ("Claude Code's own \"done\" time follows it from the next time Claude Code "
+                "starts; commands Claude runs follow it straight away.")
+
+
+def _load_settings_apply():
+    import importlib.machinery
+    import importlib.util
+    for cand in SETTINGS_APPLY_CANDIDATES:
+        path = os.path.normpath(cand)
+        if os.path.isfile(path):
+            prev = sys.dont_write_bytecode
+            sys.dont_write_bytecode = True
+            try:
+                loader = importlib.machinery.SourceFileLoader("wf_settings_apply", path)
+                mod = importlib.util.module_from_spec(
+                    importlib.util.spec_from_loader("wf_settings_apply", loader))
+                loader.exec_module(mod)
+                return mod
+            finally:
+                sys.dont_write_bytecode = prev
+    return None
+
+
+SA = _load_settings_apply()
+
+
+# ------------------------------------------------------------------- the zone database
+
+def _tzpath():
+    try:
+        import zoneinfo
+        return tuple(zoneinfo.TZPATH) or DEFAULT_TZPATH
+    except ImportError:
+        return DEFAULT_TZPATH
+
+
+def _zone_file(name):
+    """The TZif file for `name`, or None. The name is shape-checked first, so it cannot
+    climb out of the database directory."""
+    if not name or not NAME_SHAPE.match(name):
+        return None
+    for base in _tzpath():
+        path = os.path.join(base, name)
+        try:
+            with open(path, "rb") as fh:
+                if fh.read(4) == b"TZif":
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+# Files in the zone database that are not zones a person lives in.
+NOT_ZONES = {"posixrules", "localtime", "Factory", "leapseconds", "posix", "right"}
+
+
+def is_zone(name):
+    """True when `name` is a zone this machine can resolve."""
+    if not name or not NAME_SHAPE.match(name) or name.split("/")[0] in NOT_ZONES:
+        return False
+    if _zone_file(name):
+        return True
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def zone_at(name, ts):
+    """`(utc offset in seconds, abbreviation)` for zone `name` at epoch `ts`, or None."""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.datetime.fromtimestamp(ts, ZoneInfo(name))
+        return int(dt.utcoffset().total_seconds()), dt.tzname()
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    if not hasattr(time, "tzset") or not _zone_file(name):
+        return None
+    old = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = name
+        time.tzset()
+        lt = time.localtime(ts)
+        return lt.tm_gmtoff, lt.tm_zone
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def clock(name, ts=None):
+    """`7:55 PM EDT` — the wall-clock time in `name` now, or None."""
+    ts = time.time() if ts is None else ts
+    info = zone_at(name, ts)
+    if info is None:
+        return None
+    t = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=int(ts) + info[0])
+    hour = t.hour % 12 or 12
+    return "%d:%02d %s %s" % (hour, t.minute, "AM" if t.hour < 12 else "PM", info[1])
+
+
+def same_zone(a, b):
+    if a == b:
+        return True
+    if a in UTC_NAMES and b in UTC_NAMES:
+        return True
+    fa, fb = _zone_file(a), _zone_file(b)
+    if fa and fb:
+        try:
+            with open(fa, "rb") as x, open(fb, "rb") as y:
+                return x.read() == y.read()
+        except OSError:
+            return False
+    return False
+
+
+def system_zone():
+    """This machine's own zone, read from its configuration — never from `$TZ`, which under
+    Claude Code is the very setting this script writes."""
+    try:
+        target = os.readlink("/etc/localtime")
+        if "zoneinfo/" in target:
+            name = target.split("zoneinfo/", 1)[1]
+            if is_zone(name):
+                return name
+    except OSError:
+        pass
+    try:
+        with open("/etc/timezone", encoding="utf-8") as fh:
+            name = fh.read().strip()
+        if is_zone(name):
+            return name
+    except OSError:
+        pass
+    return None
+
+
+# --------------------------------------------------------------- the commit-time guess
+
+def git_hint(root):
+    """The zone the user's own recent commit times fit best, or None.
+
+    A commit records the author's UTC offset at the moment it was made, on whatever machine
+    made it, so on a server whose clock is UTC the commits pushed from the user's own laptop
+    still say where they are. It is a GUESS and is labelled one: an offset names many zones,
+    and a commit made on the server itself says only that the server is UTC — so when this
+    machine is at UTC, commits at +0000 are left out rather than read as a vote for London.
+    """
+    if not root or not os.path.isdir(root):
+        return None
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+
+    def git(*args):
+        try:
+            p = subprocess.run(GIT + ["-C", root] + list(args), stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, universal_newlines=True,
+                               env=env, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return p.stdout if p.returncode == 0 else None
+
+    email = (git("config", "user.email") or "").strip()
+    if not email:
+        return None
+    out = git("log", "-n", str(COMMITS_READ), "-F", "--author=" + email,
+              "--format=%at %ai")
+    commits = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        m = re.match(r"^([+-])(\d\d)(\d\d)$", parts[-1]) if len(parts) >= 2 else None
+        if not m or not parts[0].isdigit():
+            continue
+        off = (int(m.group(2)) * 3600 + int(m.group(3)) * 60) * (-1 if m.group(1) == "-" else 1)
+        commits.append((int(parts[0]), off))
+    sysz = system_zone()
+    if sysz:
+        commits = [(ts, off) for ts, off in commits
+                   if not (off == 0 and (zone_at(sysz, ts) or (None,))[0] == 0)]
+    if not commits:
+        return None
+    best, best_n = None, 0
+    for zone in HINT_ZONES:
+        n = 0
+        for ts, off in commits:
+            info = zone_at(zone, ts)
+            if info is not None and info[0] == off:
+                n += 1
+        if n > best_n:
+            best, best_n = zone, n
+    if best is None:
+        return None
+    return {"zone": best, "matched": best_n, "of": len(commits)}
+
+
+# ------------------------------------------------------------------- the settings file
+
+def settings_path():
+    return SA.user_settings_path()
+
+
+def record_path():
+    return os.path.join(SA.config_root(), "workforce", ".settings-owned.json")
+
+
+def read_settings(path):
+    """`(data, text, error)`. An absent file is `({}, None, None)`."""
+    if not os.path.lexists(path):
+        return {}, None, None
+    data, text, err = SA._load_strict(path)
+    if err:
+        return None, text, "%s is not valid JSON (%s); nothing was written" % (path, err)
+    if not isinstance(data, dict):
+        return None, text, "%s does not hold a JSON object; nothing was written" % path
+    env = data.get("env")
+    if env is not None and not isinstance(env, dict):
+        return None, text, "%s has an \"env\" that is not an object; nothing was written" % path
+    return data, text, None
+
+
+def current_tz(data):
+    env = data.get("env") if isinstance(data, dict) else None
+    tz = env.get("TZ") if isinstance(env, dict) else None
+    return tz if isinstance(tz, str) else None
+
+
+def read_record():
+    data, _err = SA.load(record_path())
+    return data if isinstance(data, dict) else {}
+
+
+def owned_value(rec):
+    added = rec.get("env_added")
+    return added.get("TZ") if isinstance(added, dict) else None
+
+
+def project_overrides(root):
+    """Project settings files that set `env.TZ` themselves, and so win over user scope."""
+    found = []
+    if not root:
+        return found
+    user = os.path.realpath(settings_path())
+    for name in ("settings.local.json", "settings.json"):
+        path = os.path.join(root, ".claude", name)
+        if os.path.realpath(path) == user:
+            continue
+        data, _ = SA.load(path)
+        tz = current_tz(data)
+        if tz is not None:
+            found.append({"path": path, "value": tz})
+    return found
+
+
+# --------------------------------------------------------- the character-level edits
+
+def _indent_unit(text):
+    m = re.search(r"^([ \t]+)\S", text or "", re.M)
+    return m.group(1) if m else "  "
+
+
+def _newline(text):
+    return "\r\n" if "\r\n" in (text or "") else "\n"
+
+
+def _key_end(text, ks):
+    j = ks + 1
+    while text[j] != '"':
+        j += 2 if text[j] == "\\" else 1
+    return j + 1
+
+
+def _append_member(text, node, key, value_for):
+    """Insert `"key": <value>` after the last member of object `node`, copying the
+    separator and colon spacing the last member already uses. `value_for(base, colon)`
+    renders the value for a member indented by `base` (None in a one-line file)."""
+    _k, ks, vnode = node["c"][-1]
+    ws = ks
+    while ws > 0 and text[ws - 1] in " \t\r\n":
+        ws -= 1
+    sep = text[ws:ks]
+    colon = text[_key_end(text, ks):vnode["s"]]
+    base = sep.rsplit("\n", 1)[1] if "\n" in sep else None
+    piece = "," + sep + json.dumps(key) + colon + value_for(base, colon)
+    return text[:vnode["e"]] + piece + text[vnode["e"]:]
+
+
+def _env_object(zone, base, unit, nl, colon=": "):
+    if base is None:
+        return '{"TZ"' + colon + json.dumps(zone) + "}"
+    return "{" + nl + base + unit + '"TZ"' + colon + json.dumps(zone) + nl + base + "}"
+
+
+def text_with_tz(text, zone):
+    """`(new text, env object created?)` — `text` with env.TZ set to `zone` and every
+    other character unchanged."""
+    if text is None or not text.strip():
+        return json.dumps({"env": {"TZ": zone}}, indent=2) + "\n", True
+    unit, nl = _indent_unit(text), _newline(text)
+    top = SA._spans(text)
+    _ei, env = SA._member(top, "env")
+    if env is not None:
+        _ti, tz = SA._member(env, "TZ")
+        if tz is not None:
+            return text[:tz["s"]] + json.dumps(zone) + text[tz["e"]:], False
+        if env["c"]:
+            return _append_member(text, env, "TZ", lambda b, c: json.dumps(zone)), False
+        line = text.rfind("\n", 0, env["s"]) + 1
+        base = (re.match(r"[ \t]*", text[line:]).group(0)
+                if "\n" in text[top["s"]:top["e"]] else None)
+        return text[:env["s"]] + _env_object(zone, base, unit, nl) + text[env["e"]:], False
+    if top["c"]:
+        return _append_member(text, top, "env",
+                              lambda b, c: _env_object(zone, b, unit, nl, c)), True
+    body = "{" + nl + unit + '"env": ' + _env_object(zone, unit, unit, nl) + nl + "}"
+    return text[:top["s"]] + body + text[top["e"]:], True
+
+
+def text_without_tz(text, drop_env):
+    """`text` with env.TZ cut out — and the whole env member when `drop_env` and TZ was its
+    only member. An object the cut empties becomes `{}`, which is what it was before."""
+    top = SA._spans(text)
+    ei, env = SA._member(top, "env")
+    ti, tz = SA._member(env, "TZ") if env is not None else (None, None)
+    if tz is None:
+        return text
+    if len(env["c"]) > 1:
+        a, b = SA._cut(env["c"], ti)
+        return text[:a] + text[b:]
+    if not drop_env:
+        return text[:env["s"]] + "{}" + text[env["e"]:]
+    if len(top["c"]) > 1:
+        a, b = SA._cut(top["c"], ei)
+        return text[:a] + text[b:]
+    return text[:top["s"]] + "{}" + text[top["e"]:]
+
+
+def _expected(data, zone):
+    want = json.loads(json.dumps(data))
+    env = want.get("env")
+    if zone is None:
+        if isinstance(env, dict):
+            env.pop("TZ", None)
+    else:
+        want.setdefault("env", {})["TZ"] = zone
+    return want
+
+
+def _write(path, new, before):
+    """Write `new` over the REAL file (a settings file linked into a dotfiles repository
+    stays a link), refusing when the file changed since it was read."""
+    real = os.path.realpath(path)
+    if before is None:
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+    return SA._atomic_write(real, new, before=before)
+
+
+def _write_record(rec, original_text):
+    path = record_path()
+    side = os.path.dirname(path)
+    refusal = SA._record_refusal(
+        path, os.path.join(os.path.realpath(SA.config_root()), "workforce"))
+    if refusal:
+        return refusal
+    os.makedirs(side, exist_ok=True)
+    SA._atomic_write(path, SA._render(rec, original_text or ""),
+                     before=original_text if os.path.exists(path) else None)
+    return None
+
+
+def _record_text():
+    path = record_path()
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+# ------------------------------------------------------------------------------ show
+
+def gather(root):
+    path = settings_path()
+    data, _text, err = read_settings(path)
+    pref = current_tz(data) if data is not None else None
+    rec = read_record()
+    sysz = system_zone()
+    hint = git_hint(root)
+    now = time.time()
+
+    cands = []
+
+    def add(zone, source, note):
+        if not zone or any(same_zone(zone, c["zone"]) for c in cands):
+            return
+        cands.append({"zone": zone, "source": source, "note": note, "now": clock(zone, now),
+                      "current": False, "recommended": False})
+
+    if pref:
+        add(pref, "setting", "your current setting" if is_zone(pref)
+            else "your current setting — not a zone this machine knows")
+        cands[0]["current"] = True
+    if hint:
+        add(hint["zone"], "commits", "a guess from your commit times (%d of your last %d)"
+            % (hint["matched"], hint["of"]))
+    add(sysz, "system", "this machine's clock")
+    add("UTC", "utc", "Coordinated Universal Time")
+    for zone in COMMON_ZONES:
+        if len(cands) >= 2:
+            break
+        add(zone, "common", "a common choice, not a guess about you")
+    cands = cands[:4]
+    if not pref and cands:
+        cands[0]["recommended"] = True
+
+    exe = os.path.abspath(__file__)
+    return {
+        "settings": path,
+        "settings_error": err,
+        "preference": pref,
+        "preference_set_by_workforce": bool(pref) and owned_value(rec) == pref,
+        "system": sysz,
+        "hint": hint,
+        "overridden_by": project_overrides(root),
+        "candidates": cands,
+        "set_command": "%s set" % shlex.quote(exe),
+        "clear_command": "%s clear" % shlex.quote(exe),
+        "restart": RESTART_NOTE,
+    }
+
+
+def do_show(root, as_json):
+    g = gather(root)
+    if as_json:
+        print(json.dumps(g, indent=2))
+        return 0
+    print("TIME ZONE  %s   <- user scope: every project on this machine" % g["settings"])
+    if g["settings_error"]:
+        print("  ! %s" % g["settings_error"])
+    if g["preference"]:
+        who = "set by workforce" if g["preference_set_by_workforce"] else "set by hand"
+        print("  your setting   %s   (%s)   now %s"
+              % (g["preference"], who, clock(g["preference"]) or "unknown"))
+    else:
+        print("  your setting   none — Claude Code uses this machine's clock")
+    print("  this machine   %s   now %s" % (g["system"] or "unknown",
+                                           clock(g["system"]) if g["system"] else "unknown"))
+    for o in g["overridden_by"]:
+        # json.dumps: the value comes from a project file, which may hold terminal escapes.
+        print("  ! %s sets TZ=%s for that project, and it wins over this setting there"
+              % (o["path"], json.dumps(o["value"])))
+    print("\n  candidates:")
+    for i, c in enumerate(g["candidates"], 1):
+        tag = " (current)" if c["current"] else " (recommended)" if c["recommended"] else ""
+        print("    %d. %s%s — %s — now %s" % (i, c["zone"], tag, c["note"], c["now"] or "unknown"))
+    print("\n  set one:   %s <Area/City>" % g["set_command"])
+    print("  remove it: %s" % g["clear_command"])
+    print("  %s" % RESTART_NOTE)
+    return 0
+
+
+# ------------------------------------------------------------------------- set, clear
+
+def _refused_write(exc, zone):
+    exe = shlex.quote(os.path.abspath(__file__))
+    cmd = "%s set %s" % (exe, zone) if zone else "%s clear" % exe
+    print("wf-timezone: could not write %s (%s); nothing was changed." % (settings_path(), exc),
+          file=sys.stderr)
+    print("  run it yourself in Claude Code:  ! %s" % cmd, file=sys.stderr)
+
+
+def do_set(zone):
+    if not is_zone(zone):
+        print("wf-timezone: \"%s\" is not a time zone this machine knows. Use a name like "
+              "America/New_York, Europe/London or Asia/Tokyo. Nothing was written." % zone,
+              file=sys.stderr)
+        return 2
+    path = settings_path()
+    data, text, err = read_settings(path)
+    if err:
+        print("wf-timezone: %s" % err, file=sys.stderr)
+        return 1
+    print("TIME ZONE  %s   <- user scope: every project on this machine" % path)
+    old = current_tz(data)
+    rec = read_record()
+    if old == zone:
+        print("  . env.TZ is already %s — nothing to change" % json.dumps(zone))
+        print("  now %s in %s" % (clock(zone), zone))
+        return 0
+
+    new, created = text_with_tz(text, zone)
+    if json.loads(new) != _expected(data, zone):
+        print("wf-timezone: the edit did not reproduce the intended settings; nothing was "
+              "written", file=sys.stderr)
+        return 1
+
+    # THE RECORD FIRST, so a value workforce wrote is never on disk unrecorded.
+    rec_before = _record_text()
+    added = rec.get("env_added") if isinstance(rec.get("env_added"), dict) else {}
+    keep_flag = owned_value(rec) is not None and bool(rec.get("env_object_added"))
+    rec = dict(rec, env_added=dict(added, TZ=zone))
+    rec["env_object_added"] = bool(created or keep_flag)
+    try:
+        refusal = _write_record(rec, rec_before)
+    except (OSError, RuntimeError) as exc:
+        refusal = str(exc)
+    if refusal:
+        print("wf-timezone: %s; nothing was written" % refusal, file=sys.stderr)
+        return 1
+    try:
+        _write(path, new, text)
+    except (OSError, RuntimeError) as exc:
+        if rec_before is None:
+            os.unlink(record_path())
+        else:
+            SA._atomic_write(record_path(), rec_before)
+        _refused_write(exc, zone)
+        return 1
+
+    back, _t, err = read_settings(path)
+    if err or current_tz(back) != zone:
+        print("wf-timezone: re-read of %s did not show env.TZ = %s" % (path, json.dumps(zone)),
+              file=sys.stderr)
+        return 1
+    print("  + env.TZ = %s   (%s)" % (json.dumps(zone), "was %s" % json.dumps(old) if old
+                                      else "was not set"))
+    print("  verified on disk: env.TZ = %s" % json.dumps(current_tz(back)))
+    print("  recorded in %s" % record_path())
+    print("  now %s in %s" % (clock(zone), zone))
+    print("  %s" % RESTART_NOTE)
+    return 0
+
+
+def do_clear():
+    path = settings_path()
+    data, text, err = read_settings(path)
+    if err:
+        print("wf-timezone: %s" % err, file=sys.stderr)
+        return 1
+    print("TIME ZONE  %s   <- user scope: every project on this machine" % path)
+    old = current_tz(data)
+    rec = read_record()
+    ours = owned_value(rec)
+    if old is None:
+        print("  . env.TZ is not set — nothing to remove")
+    else:
+        # The env object goes too only when workforce made it and TZ is all it holds.
+        drop = ours == old and bool(rec.get("env_object_added")) and len(data["env"]) == 1
+        new = text_without_tz(text, drop_env=drop)
+        want = _expected(data, None)
+        if drop:
+            want.pop("env", None)
+        if json.loads(new) != want:
+            print("wf-timezone: the edit did not reproduce the intended settings; nothing "
+                  "was written", file=sys.stderr)
+            return 1
+        try:
+            _write(path, new, text)
+        except (OSError, RuntimeError) as exc:
+            _refused_write(exc, None)
+            return 1
+        back, _t, err = read_settings(path)
+        if err or current_tz(back) is not None:
+            print("wf-timezone: re-read of %s still shows env.TZ" % path, file=sys.stderr)
+            return 1
+        print("  - env.TZ removed   (was %s, %s)" % (json.dumps(old), "set by workforce"
+                                                     if ours == old else "set by hand"))
+        print("  verified on disk: env.TZ absent")
+    if ours is not None:
+        added = dict(rec.get("env_added") or {})
+        added.pop("TZ", None)
+        rec = dict(rec, env_added=added)
+        rec.pop("env_object_added", None)
+        if not added:
+            rec.pop("env_added", None)
+        try:
+            refusal = _write_record(rec, _record_text())
+        except (OSError, RuntimeError) as exc:
+            refusal = str(exc)
+        if refusal:
+            print("wf-timezone: the setting is gone but the record could not be updated: %s"
+                  % refusal, file=sys.stderr)
+            return 1
+    if old is not None:
+        print("  Claude Code goes back to this machine's clock (%s). %s"
+              % (system_zone() or "unknown", RESTART_NOTE))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
+                    help="the project whose commit times and settings are read (show only)")
+    ap.add_argument("action", choices=("show", "set", "clear"))
+    ap.add_argument("zone", nargs="?")
+    ap.add_argument("--json", action="store_true", help="show: machine-readable output")
+    args = ap.parse_args(argv)
+    if SA is None:
+        print("wf-timezone: the workforce skill is not installed beside this one, so its "
+              "settings writer cannot be loaded. Run the workforce installer.", file=sys.stderr)
+        return 1
+    if args.action == "set":
+        if not args.zone:
+            print("wf-timezone: set needs a zone, like America/New_York", file=sys.stderr)
+            return 2
+        return do_set(args.zone.strip())
+    if args.zone:
+        print("wf-timezone: %s takes no zone" % args.action, file=sys.stderr)
+        return 2
+    if args.action == "clear":
+        return do_clear()
+    return do_show(os.path.abspath(args.root), args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

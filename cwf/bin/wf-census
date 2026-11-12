@@ -1,0 +1,1275 @@
+#!/usr/bin/env python3
+"""wf-census — the registry, marker, and hook census `audit` runs on a host.
+
+Why a script and not a checklist. This project's own CLAUDE.md records the ledger
+count being wrong THREE TIMES — 24-vs-20, 27-vs-23, and an "index claims 0" that a
+wrong root manufactured — and every time the hand count was the thing that was
+wrong, not the target. A census that can be re-run is the only kind that can be
+compared, and `conversion-taxonomy.md` already ships the rule to users:
+
+    "No count in this project is hand-derived."
+
+Until 2026-08-03 that sentence named `bin/baseline`, which does not ship. This is
+the shipped half: the counts `audit` Step 1b needs, computed rather than read.
+
+REPORTS; NEVER REPAIRS. It writes exactly one artifact — the manifest it is asked
+for — and never edits an agent, a skill, or a settings file. Same rule
+`data-skills.md` § Maintainers puts on every maintainer.
+
+Exit codes
+    0  census complete, no blocking condition
+    2  a blocking condition: an unresolved name collision, or a path it could not
+       read. NEVER 0 on an unreadable tree — a validator exiting 0 on a file it
+       could not open reports health it did not measure.
+
+Usage
+    wf-census [--root DIR] [--json PATH] [--manifest PATH] [--quiet]
+"""
+
+import argparse
+import json
+import os
+import fnmatch
+import hashlib
+import re
+import shlex
+import sys
+
+
+def config_root():
+    """Personal config root. $CLAUDE_CONFIG_DIR relocates the whole ~/.claude tree
+    (scopes.md § Installing into a specific CLAUDE_CONFIG_DIR), so user-scope agents
+    and settings must be read from there. Unset, it is exactly ~/.claude."""
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+# ── the ONE workforce-row resolver ────────────────────────────────────────────
+# "Is this hook row a workforce hook, which script does it name, and where does that
+# script resolve?" had three answers on 2026-09-14 — a strict path test in the settings
+# heal, a lenient expander for the wiring, and this census — and they disagreed: the
+# per-session form the wiring wrote was a row the heal could not see and the census
+# called undecidable. One function now answers it, and all three read it.
+PER_SESSION_ROOT = "${CODEX_HOME:-$HOME/.codex}"
+WF_BIN_RX = re.compile(r"^(?P<prefix>.*?)/skills/workforce/bin/(?P<script>wf-[a-z0-9-]+)$")
+_WF_PREFIXES = (("${CWF_PROJECT_DIR}", "project"), ("$CWF_PROJECT_DIR", "project"),
+                (PER_SESSION_ROOT, "session"), ("${HOME}", "home"), ("$HOME", "home"))
+_WF_META = set("$`\"';&|<>(){}*?[]!#~\n\t")
+
+
+# ── the ONE sacred-block scope ────────────────────────────────────────────────
+# Which files `.directives.sha` must hold a row for. `wf-stamp` WRITES rows over this set
+# and `wf-conform` DEMANDS rows over it, so it is answered here, once, and both call it.
+# Until 2026-09-15 each had its own answer: stamp read four roots (`agents`, `skills`,
+# `workforce/directives`, `workforce/personnel`) with its own `.censusignore` matcher, and
+# conform walked all of `.claude/`. Customer DEF-Q-006 on a real host: an unchanged archive
+# copy under `.claude/workforce/migrated/` held one sacred block, which conform required and
+# stamp could not write. The BLOCKING row cleared only when someone hand-edited
+# `.censusignore`. The denominator comes from the tree (conform's doctrine), so stamp now
+# covers what conform demands. Conform does not check less.
+#
+# `retired/` JOINED THE LIST 2026-09-16 (apps-odyssey-alive DEF-Q-19). audit Step 6-F archives a
+# migrated catalog there byte-for-byte AFTER lifting every `origin: user` span into its
+# `CATALOG-ANCHOR.md` and reading it back, so the archive is an undo copy whose spans are
+# guarded at source, the same kind of copy `staging/` holds. Stamping it guards nothing. Left
+# in scope, it was the org's only hard `wf-conform` failure: 8 blocks in two archives.
+SACRED_SCRATCH = (os.path.join(".claude", "workforce", "work"),
+                  os.path.join(".claude", "workforce", "staging"),
+                  os.path.join(".claude", "workforce", "retired"))
+
+
+# ── a record is not a reader ─────────────────────────────────────────────────
+# Beside the scratch DIRECTORIES above, the record FILES a workforce tool writes about a
+# run. A tool's own output quotes paths by the dozen and reads none of them: `deferred.md`
+# is a queue of findings, `.symlink-manifest.txt` is a list of what `install` linked,
+# `census.json` is what a scan saw. MEASURED 2026-09-25 on a real project: `wf-catalog
+# --migrate` counted both of the first two as live readers and kept nine files of an
+# already-retired copy on the strength of a deferment-queue line quoting their paths. A
+# queue outliving the thing it complains about is how a copy becomes unretirable, against
+# the directive that says the old copies go.
+#
+# A RULE, NOT TODAY'S FILENAMES (`evaluators.md` § A register scoped by enumeration goes
+# stale). Three shapes of tool output, each measured on a real tree: a scan or sidecar
+# (`census.json`, `conform.json`, `.directives.sha`, `scheduled_tasks.lock`), anything
+# named `manifest` (`.symlink-manifest.txt`, `.agents-symlink-manifest.txt`), and the two
+# prose records a run writes by name.
+#
+# WHAT IS DELIBERATELY NOT HERE, because an employee reads it and a path it names is a
+# real read: `grounding/`, `recruiting/`, `personnel/`, `directives/`, every handbook,
+# every skill, and `CLAUDE.md`.
+RECORD_SUFFIXES = (".json", ".sha", ".lock")
+RECORD_NAMES = ("deferred.md", "dispositions.md")
+# AND THE PERSONNEL STORE, whole. `AMD-`, `DEF-`, `ORG-`, `PERF-` and `EMP-` files are
+# records ABOUT a change, an employee or a defect — written after the fact, by the run that
+# made it. No employee grounds on one: an amendment record describes an edit to a handbook,
+# and the handbook is what gets read. MEASURED 2026-09-25 on a real project, where
+# `AMD-2026-09-14-media-producer-audit-heal.md` was the sole hold on image-eval's
+# `references/ai-patterns.md` and part of the hold on text-eval's `SKILL.md` — a retirement
+# blocked by the write-up of an earlier one.
+#
+# THE DIRECTORY, NOT THE `AMD-` PREFIX. The record types are open — `personnel-templates.md`
+# adds to them — so a prefix list here would go stale the first time one did. The store's
+# owner is `wf-ledger.STORE`, and the path is stated here rather than imported for the same
+# reason `wf-catalog.install_candidates` restates wf-seed's list: a shipped script importing
+# a sibling AT IMPORT TIME breaks whenever that sibling cannot be read. The two must agree.
+# `bin/check` asserted it until `bin/check` was retired on 2026-10-14; nothing keeps them
+# in agreement now.
+#
+# STILL READERS, and the distinction is what a file is FOR: `directives/` (the user's own
+# words), `grounding/` and `recruiting/` (written to be read by the employee they name).
+RECORD_DIRS = (os.path.join(".claude", "workforce", "personnel"),)
+
+
+def is_record_file(path):
+    """True when `path` is a record of what happened rather than something an employee reads.
+
+    Two questions, because records come in two shapes. The BASENAME answers the first, so it
+    holds wherever the file sits — a project keeping its census output one directory over
+    still gets the right answer. The PATH answers the second: the personnel store is a store,
+    and what is in it is in it because a run filed it there.
+    """
+    base = os.path.basename(path).lower()
+    if (base in RECORD_NAMES or "manifest" in base or base.endswith(RECORD_SUFFIXES)):
+        return True
+    norm = path.replace(os.sep, "/")
+    return any(("/" + d.replace(os.sep, "/") + "/") in ("/" + norm.lstrip("/"))
+               for d in RECORD_DIRS)
+
+
+def report_rows(rows, key=None):
+    """Every row set the report prints, in a STABLE order. One helper, called by all five.
+
+    THE ORDER WAS THE FILESYSTEM'S. These maps and lists are filled in `os.walk` order, so a
+    report's rows followed the directory entries of whatever tree was read — and a fresh COPY
+    of one tree enumerates in a different order than the original. MEASURED 2026-09-25 by
+    `bin/corpus`, which runs this script against a copy of a real org and diffs the output
+    against a golden: `image-validator` and `character-scanner` swapped places between two runs
+    of the same unchanged tree, and so did the two `unreadable` rows.
+
+    `audit.md` Step 7 rests on comparing one run's report against another's — *"comparing two
+    runs is the only way to tell whether a change helped"* — and this script's own header says
+    a census that can be re-run is the only kind that can be compared. Rows that move on their
+    own make every such comparison a diff of noise, which is the same defect as a count nobody
+    can reproduce.
+
+    One function rather than five `sorted(...)` calls, so the property is stated once and can be
+    broken in one place: deleting the sort below sends this report back to printing whatever
+    order the directory happened to hold (`bin/prove` did exactly that until it was
+    retired on 2026-10-14).
+    """
+    out = list(rows.items() if hasattr(rows, "items") else rows)
+    out.sort(key=key)
+    return out
+
+
+def sacred_scope(root):
+    """(files, scratch_skipped): every `.md` under `<root>/.claude` whose sacred blocks the
+    sidecar must stamp, sorted, plus the number of `.md` files in run scratch left out.
+
+    Excluded, and nothing else: the run scratch (`SACRED_SCRATCH`: `workforce/work`,
+    `workforce/staging`, `workforce/retired`), which holds COPIES whose originals are guarded at source (`wf-conform` § check_sidecar
+    records the 846-file measurement), and whatever `.censusignore` declares. It is
+    DECLARED, never inferred, and read through `Census.ignored`, the one matcher. A
+    project-created folder like `.claude/workforce/migrated/` is in scope, because nothing
+    declared it out.
+    """
+    claude = os.path.join(root, ".claude")
+    scratch = tuple(os.path.join(root, s) for s in SACRED_SCRATCH)
+    skipped = 0
+    for s in scratch:
+        for _dp, _dn, fns in os.walk(s):
+            skipped += len([f for f in fns if f.endswith(".md")])
+    census = Census(root)
+    census.load_ignore()
+    files = []
+    for dirpath, dirnames, filenames in os.walk(claude):
+        if any(dirpath == d or dirpath.startswith(d + os.sep) for d in scratch):
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(d for d in dirnames if not census.ignored(os.path.join(dirpath, d)))
+        for fn in sorted(filenames):
+            p = os.path.join(dirpath, fn)
+            if fn.endswith(".md") and not census.ignored(p):
+                files.append(p)
+    return sorted(files), skipped
+
+
+def workforce_hook(command, root):
+    """A workforce hook row, resolved, or None. Never raises.
+
+    Accepts exactly the forms workforce writes, each optionally inside ONE pair of
+    quotes: an absolute path, `${CLAUDE_PROJECT_DIR}/…` (resolved to `root`), the
+    per-session `${CODEX_HOME:-$HOME/.codex}/…` (resolved to THIS process's
+    config root, which is the running session's), and `$HOME/…`. The rest of the
+    path must end in `/skills/workforce/bin/wf-<name>` and carry no shell syntax, no
+    other variable and no unquoted space. Anything else is not a workforce row here, dead
+    or alive. A `..` component is allowed and NEVER normalised: every decision downstream
+    is a kernel stat or a realpath of the joined path, both physically correct across a
+    symlinked directory, so there is no removal decision a `..` could mislead.
+
+    Returns {"script", "cfg", "bin", "path", "exists", "form"}; `form` is one of
+    absolute, project, session, home.
+    """
+    if not isinstance(command, str):
+        return None
+    c = command.strip()
+    quoted = len(c) >= 2 and c[0] == c[-1] and c[0] in "\"'"
+    if quoted:
+        c = c[1:-1]
+    if os.sep == "\\":
+        c = c.replace("\\", "/")
+    m = WF_BIN_RX.match(c)
+    if not m:
+        return None
+    prefix, form, base = m.group("prefix"), "absolute", ""
+    for token, kind in _WF_PREFIXES:
+        if prefix.startswith(token):
+            prefix, form = prefix[len(token):], kind
+            base = {"project": root or "", "session": config_root(),
+                    "home": os.path.expanduser("~")}[kind]
+            break
+    if (any(ch in _WF_META for ch in prefix) or (" " in prefix and not quoted)
+            or (form == "project" and not root)):
+        return None
+    cfg = base + prefix
+    if not os.path.isabs(cfg):
+        return None
+    bin_dir = os.path.join(cfg, "skills", "workforce", "bin")
+    path = os.path.join(bin_dir, m.group("script"))
+    return {"script": m.group("script"), "cfg": cfg, "bin": bin_dir, "path": path,
+            "exists": os.path.exists(path), "form": form}
+
+
+# Anchored for the same reason MARKER_RX is: a file DOCUMENTING the marker
+# convention mentions it in prose and inside backticks. Unanchored, this reported
+# 10 of 21 immutable blocks "unpaired" on a real project — and an unpaired sacred
+# block is the most alarming thing this census can say, because the extraction gate
+# blocks every deletion on it. Also tolerant of the `| added: <date> |` field that
+# real blocks carry, which the old pattern silently refused to match.
+# PAIRING IS OVER ALL ORIGIN BLOCKS; the user-immutable count is a SUBSET of them.
+#
+# `<!-- /origin -->` closes ANY origin block — user, skill-builder, workforce — so
+# pairing user-immutable OPENS against every CLOSE compares two different
+# populations. Measured 2026-08-03: that arithmetic reported 30 of 59 sacred blocks
+# "unpaired" on a real project where the true figure is 0, because a typical file
+# holds one user block and two generator blocks and closes all three the same way.
+#
+# An unpaired sacred block is the most alarming thing this census can say — the
+# extraction gate blocks every deletion on it — so a false one is expensive twice.
+ORIGIN_OPEN = re.compile(r"^\s*<!--\s*origin:\s*[^>]*-->\s*$", re.M)
+ORIGIN_CLOSE = re.compile(r"^\s*<!--\s*/origin\s*-->\s*$", re.M)
+# LINE-ANCHORED AT COLUMN 0, and the indent is the discriminator. In markdown a line
+# indented four spaces IS a code block, so an indented marker is documentation ABOUT
+# the format, never a span opener. `bin/baseline` established this and measured it:
+# 68 naive against 37 anchored on the first sweep — 31 mentions, 46% inflation — and
+# the extraction gate blocked a completable sweep because the census it asserted
+# against was counting prose.
+#
+# Measured here 2026-08-05 on odyssey-alive: this pattern reported 118 sacred blocks
+# and TWO of them were not sacred blocks. Both were the same line inside an indented
+# example — `origin: user | added: YYYY-MM-DD | immutable: true`, where `YYYY-MM-DD`
+# is literal. A directive-protection hook firing on a date format string is a false
+# positive that trains a reader to ignore it.
+IMMUTABLE_OPEN = re.compile(
+    r"^<!--\s*origin:\s*user\b[^>]*immutable:\s*true[^>]*-->$", re.M)
+# Reported, never silently dropped — `bin/baseline`: "a number that shrank without
+# explanation is its own defect."
+IMMUTABLE_MENTION = re.compile(
+    r"^[ \t]+<!--\s*origin:\s*user\b[^>]*immutable:\s*true[^>]*-->[ \t]*$", re.M)
+NAME_RX = re.compile(r"^name:\s*['\"]?([^'\"\n]+?)['\"]?\s*$", re.M)
+# `FOO=bar cmd` — a command prefixed by environment assignments. The VALUE very often
+# contains a slash (`CLAUDE_PROJECT_DIR=/home/…`), which is exactly what makes an
+# assignment mistakable for the path being run. See Census._resolve_segment.
+ENV_ASSIGN_RX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# ONE LEADING INTERPRETER OPTION, per interpreter family. Each grammar returns
+# (consumed, why): `why` set means the call runs no file; `consumed` 0 means `t` is
+# the operand; _END means `t` ends the options and the next token is the operand;
+# otherwise it is how many tokens the option takes, its argument included. Skipping
+# the argument is what keeps `python3 -W ignore x.py` from naming `ignore`.
+_END = -1
+_SH_ARG_LONG = ("--rcfile", "--init-file")
+_NODE_INLINE = ("-e", "--eval", "-p", "--print", "-pe", "-ep")
+_NODE_ARG = ("-r", "--require", "--import", "--loader", "--experimental-loader",
+             "-C", "--conditions")
+_PWSH_INLINE = ("-c", "-command", "-e", "-ec", "-encodedcommand", "-cwa",
+                "-commandwithargs")
+_PWSH_FILE = ("-f", "-file")
+_PWSH_ARG = ("-ex", "-ep", "-executionpolicy", "-wd", "-workingdirectory", "-config",
+             "-configurationname", "-o", "-of", "-outputformat", "-if", "-inputformat",
+             "-w", "-windowstyle", "-settingsfile", "-custompipename")
+
+
+def _sh_option(interp, t):
+    """sh/bash/zsh: a short cluster holding `c` is inline (`-ec`, `-xc`)."""
+    if t == "-":  # a lone `-` ends the options, as `--` does
+        return _END, None
+    if t.startswith("--"):
+        return (2 if t in _SH_ARG_LONG else 1), None
+    if len(t) < 2 or t[0] not in "-+":
+        return 0, None
+    flags = t[1:]
+    if t[0] == "-" and "c" in flags:
+        return 0, f"inline script (`{interp} {t}`)"
+    if t[0] == "-" and "s" in flags:
+        return 0, f"script read from stdin (`{interp} {t}`)"
+    return 1 + flags.count("o") + flags.count("O"), None  # each takes the next token
+
+
+def _python_option(interp, t):
+    """python: `c` in a cluster is inline (`-c`, `-Bc`); `-W`/`-X` take an argument."""
+    if t == "-":
+        return 0, f"script read from stdin (`{interp} -`)"
+    if t.startswith("--"):
+        return (2 if t == "--check-hash-based-pycs" else 1), None
+    if not t.startswith("-"):
+        return 0, None
+    for j, ch in enumerate(t[1:], 1):
+        if ch == "c":
+            return 0, f"inline script (`{interp} {t[:j + 1]}`)"
+        if ch == "m":
+            return 0, f"module run (`{interp} {t[:j + 1]}`), not a file"
+        if ch in "WX":
+            # The rest of the cluster is the argument, or else the next token is.
+            return (2 if j == len(t) - 1 else 1), None
+    return 1, None
+
+
+def _node_option(interp, t):
+    """node: `-e`, `--eval`, `-p`, `--print` are inline."""
+    if t == "-":
+        return 0, f"script read from stdin (`{interp} -`)"
+    if t in _NODE_INLINE or t.startswith(("--eval=", "--print=")):
+        return 0, f"inline script (`{interp} {t.split('=', 1)[0]}`)"
+    if not t.startswith("-"):
+        return 0, None
+    return (2 if t in _NODE_ARG else 1), None
+
+
+def _pwsh_option(interp, t):
+    """pwsh: `-Command`/`-c` are inline; `-File` names the script. Case-insensitive."""
+    low = t.lower()
+    if low in _PWSH_INLINE:
+        return 0, f"inline script (`{interp} {t}`)"
+    if low in _PWSH_FILE:
+        return _END, None
+    if not t.startswith("-"):
+        return 0, None
+    return (2 if low in _PWSH_ARG else 1), None
+
+
+# Interpreters whose script operand is the file a command runs. perl and ruby are
+# deliberately absent: their `-e` and option grammar are not modelled, so they stay
+# bare names resolved on PATH, which is undecidable and never dead.
+_OPTION_GRAMMAR = {"sh": _sh_option, "bash": _sh_option, "zsh": _sh_option,
+                   "python": _python_option, "python3": _python_option,
+                   "node": _node_option, "pwsh": _pwsh_option}
+
+# Marker families are open-ended by design: a foreign generator invents its own.
+# Report unknown families rather than dropping them — four unknown families on the
+# first real target is what taught this project that an allowlist here silently
+# under-counts (references/legacy-markers.md).
+# A REAL marker is a standalone HTML comment on its own line. A marker NAMED inside
+# prose or backticks is documentation about markers, not one.
+#
+# Measured 2026-08-03: the unanchored form reported 11 unpaired "sweep hazards"
+# against a real project, ALL FALSE. The cause was sentences like
+#   - The `<!-- ROUTE-DISPATCH-CHECKPOINT START -->` marker is present exactly once
+#     and is paired with exactly one END marker
+# where START matches and the English "one END marker" does not. Five more were
+# inside workforce's OWN installed skill, so every host would see them on every
+# audit — and `procedures/audit.md` § Step 3b excludes an unpaired file from
+# extraction AND from the sweep until a human resolves it. A false hazard here
+# silently freezes a correct file.
+MARKER_RX = re.compile(
+    r"^\s*<!--\s*/?([A-Za-z][\w-]*(?:-[A-Za-z][\w-]*)*)\s+(START|END)\b[^>]*-->\s*$",
+    re.I | re.M,
+)
+
+
+class Census:
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.unreadable = []
+        self.agents = []
+        self.skill_agents = []
+        self.markers = {}
+        self.unpaired = []
+        self.hooks = []
+        self.immutable_blocks = []
+        self.skills = []
+        self.ignore_patterns = []
+        self.ignore_hits = {}
+        self.ignored_files = 0
+
+    # ── reading ──────────────────────────────────────────────────────────────
+    def read(self, path):
+        try:
+            with open(path, encoding="utf-8", errors="strict") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            # Absent, empty, unreadable and malformed are four distinct states and
+            # each is answered. "Nothing to check" is not one of them.
+            self.unreadable.append((path, type(exc).__name__))
+            return None
+
+    # ── agents ───────────────────────────────────────────────────────────────
+    def census_agents(self):
+        """Both resolving locations, plus AGENT.md under skills.
+
+        Identity comes solely from `name:`; subfolders do NOT namespace, and a
+        duplicate resolves by filesystem read order with no documented precedence
+        — the loser simply never loads and nothing reports it. So a name occupied
+        ANYWHERE in the union is occupied.
+        """
+        locations = [
+            (os.path.join(self.root, ".codex", "agents"), "project"),
+            (os.path.join(config_root(), "agents"), "personal"),
+        ]
+        for base, scope in locations:
+            if not os.path.isdir(base):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(base):
+                for fn in filenames:
+                    if not fn.endswith(".md"):
+                        continue
+                    p = os.path.join(dirpath, fn)
+                    self.agents.append(self._agent_row(p, scope))
+
+        skills = os.path.join(self.root, ".agents", "skills")
+        if os.path.isdir(skills):
+            for dirpath, _dirnames, filenames in os.walk(skills):
+                for fn in filenames:
+                    if fn == "AGENT.md":
+                        p = os.path.join(dirpath, fn)
+                        self.skill_agents.append(self._agent_row(p, "in-skill"))
+
+    def _agent_row(self, path, scope):
+        row = {
+            "path": path,
+            "scope": scope,
+            "is_symlink": os.path.islink(path),
+            "link_target": None,
+            "resolved": None,
+            "dangling": False,
+            "name": None,
+        }
+        if row["is_symlink"]:
+            row["link_target"] = os.readlink(path)
+            resolved = os.path.realpath(path)
+            row["resolved"] = resolved
+            row["dangling"] = not os.path.exists(resolved)
+        body = self.read(path)
+        if body is not None:
+            m = NAME_RX.search(body)
+            row["name"] = m.group(1).strip() if m else None
+        return row
+
+    def collisions(self):
+        """A name occupied anywhere in the union is occupied.
+
+        DEDUPE BY REAL PATH FIRST. A symlink in `.claude/agents/` pointing at an
+        in-skill `AGENT.md` is the SAME FILE reached two ways — it is the standard
+        install pattern for skills that ship agents, not a name conflict. Counting
+        both ends produced three false collisions on the first real target, and a
+        collision is BLOCKING (exit 2, and precondition 1(b) of the Atomic-or-Absent
+        gate), so the false positives would have halted a correctly-configured
+        project's audit.
+
+        Found 2026-08-03 by running this against ~/lab/odyssey-alive: 5 reported,
+        3 were symlink aliases, 2 were real. This repo's CLAUDE.md already records
+        the pattern — a drift the census reports is a claim about the census too,
+        and every previous time the target was right. That is now four for four.
+
+        AND THEN THE REMAINING TWO WERE NOT COLLISIONS EITHER.
+
+        RESOLVING is `.claude/agents/` and `~/.claude/agents/` — the only places the
+        harness resolves an agent from (`platform.md` fact 5). Two entries there
+        sharing a `name:` is a LIVE collision: one silently never loads.
+
+        An in-skill `AGENT.md` is different. Its skill loads it BY PATH ("Read
+        .claude/skills/<skill>/agents/<x>/AGENT.md"), so its `name:` is
+        documentation, not an address — `staging.md` § The same constraint applies to
+        workforce's own panel agents says exactly that. Two skills carrying a same-named template
+        collide over nothing; they are separate files, deliberately different, and
+        each caller names the one it wants.
+
+        THESE ARE TWO QUESTIONS AND THIS METHOD USED TO ANSWER ONLY ONE:
+
+          "safe for workforce to CLAIM for a new employee?"  -> the whole union,
+            because an in-skill template may be symlinked into a resolving
+            location later (`data-skills.md` § Naming). ADVISORY: it constrains
+            what we may name, never whether the user's tree is broken.
+          "is there a LIVE collision blocking this run?"      -> resolving
+            locations only. BLOCKING.
+
+        Conflating them made `namespace` blocking, and on the first real target
+        that meant halting the audit of a correctly-configured project over five
+        per-skill validator templates that had never collided with anything.
+
+        AND THE THIRD INSTANCE OF THE SAME CLASS, 2026-08-05.
+
+        `/workforce dev audit` against claude-workforce itself reported 4 live
+        collisions — the four shipped canary fixtures, present in BOTH
+        `~/.claude/agents/` and `./.claude/agents/` because the user-scope install and
+        the project-scope install each place them in their own scope, and nothing reconciles
+        the two. All four were byte-identical to each other AND to the shipped source.
+
+        THAT IS NOT WHAT A COLLISION MEANS HERE. The gate exists because one entry
+        "silently never loads" — the danger is that WHICH ONE WINS IS INVISIBLE AND
+        THEY DIFFER. Two byte-identical copies resolve to the same behaviour whichever
+        wins, so there is nothing to be wrong about. Blocking on it halted the audit of
+        a correctly-installed tree, which is the same failure as the two above.
+
+        So the split is by CONTENT, not only by path:
+
+          different bytes, same name, resolving  -> COLLISION. Blocking. One shadows
+                                                    the other and nobody can see which.
+          identical bytes, same name, resolving  -> DUPLICATE. Advisory, with the
+                                                    remedy named. It is still residue
+                                                    under the user's directive, and it
+                                                    is still not a reason to halt.
+
+        SELF-CORRECTING BY CONSTRUCTION: the moment one copy is updated and the other
+        is not, they differ, and it becomes a blocking collision again — which is
+        exactly when it starts to matter.
+        """
+        return self._by_name(self.agents)[0]
+
+    def duplicates(self):
+        """Same name, resolving locations, BYTE-IDENTICAL. Advisory — see collisions()."""
+        return self._by_name(self.agents)[1]
+
+    def shadowed(self):
+        """One copy per SCOPE, differing bytes. Advisory — and the fourth instance of the
+        class `collisions()` records three times: a blocking row on a tree this
+        distribution itself produces.
+
+        `manifest.txt` has two `agent` rows (four until `image-validator` went with
+        image-eval and `character-scanner` gave way to text-eval's `wf-text-scan`, both on
+        2026-11-10), so `install` REGISTERS a shipped evaluator's agent —
+        `code-design-advisor`, `deadcode-gardener` — into the agents/
+        directory of the scope it installed into. A
+        project that keeps its own customized copy of that evaluator registers the same name
+        at project scope. The pair is then produced by the install, and the installer already
+        says what may be done about it: *"REPORTED, NEVER REMOVED. The other scope is not
+        this install's to edit; deleting there is exactly the 'overwrite the user's
+        preferences' move the permissions directive refuses."*
+
+        AND THE AUDIT CANNOT CLEAR IT EITHER. `scopes.md`: everything an audit generates for
+        a project "is project state, written under `${CLAUDE_PROJECT_DIR}/.claude/`". So a
+        BLOCKING row here is a precondition of the Atomic-or-Absent gate whose only remedies
+        lie outside the tree the run governs — the user's own home config, or the project
+        copy its own skill requires. MEASURED 2026-10-02 on a live host: one differing
+        cross-scope pair, `character-scanner`, exit 2, and the project copy is the one
+        `text-eval/SKILL.md` requires (it emits the Verification Preamble the install's copy
+        does not mention). The run halted on a state nothing in it was allowed to repair.
+
+        SAME SCOPE IS STILL BLOCKING, and that is the half this does not touch. Two entries
+        in ONE agents/ directory are decided by filesystem read order with nothing documented
+        either way (fact 5), both are the user's to rename, and the audit writes into exactly
+        that directory. Cross-scope precedence is a different question, it is NOT part of
+        fact 5, and nothing in this repository has measured it — which is why this row names
+        both copies and asserts no winner.
+        """
+        return self._by_name(self.agents)[2]
+
+    def _by_name(self, rows):
+        """(collisions, duplicates, shadowed) — split by whether the copies differ, and
+        then by whether a differing pair is one-per-scope (see `shadowed`)."""
+        scope_of = {}
+        for row in rows:
+            scope_of.setdefault(row["path"], row["scope"])
+        seen = {}
+        for row in rows:
+            if not row["name"]:
+                continue
+            try:
+                key = os.path.realpath(row["path"])
+            except OSError:
+                key = row["path"]
+            seen.setdefault(row["name"], {})[key] = row["path"]
+
+        collisions, duplicates = {}, {}
+        for name, paths in seen.items():
+            if len(paths) < 2:
+                continue
+            found = sorted(paths.values())
+            digests = set()
+            for p in found:
+                try:
+                    with open(p, "rb") as fh:
+                        digests.add(hashlib.sha256(fh.read()).hexdigest())
+                except OSError:
+                    # Unreadable is NOT identical. Fall back to the blocking side:
+                    # a copy nobody can read is a copy nobody can prove harmless.
+                    digests.add(f"unreadable:{p}")
+            (duplicates if len(digests) == 1 else collisions)[name] = found
+
+        # THE CROSS-SCOPE SPLIT RUNS AFTER THE CONTENT SPLIT, never instead of it: a
+        # differing pair is still a disagreement and is still reported by name. What moves is
+        # the VERDICT, and only for a pair of exactly one project copy and one personal copy
+        # — the shape `install` produces and neither it nor an audit may edit away. See
+        # `shadowed` for the measurement and for why same-scope stays blocking.
+        shadowed = {}
+        for name in sorted(collisions):
+            found = collisions[name]
+            scopes = [scope_of.get(p) for p in found]
+            if len(found) == 2 and sorted(s or "" for s in scopes) == ["personal", "project"]:
+                shadowed[name] = collisions.pop(name)
+        return collisions, duplicates, shadowed
+
+    def namespace(self):
+        """Same-named in-skill templates. ADVISORY — reported, never blocking.
+
+        These constrain what workforce may name a new employee. They do not mean
+        anything is wrong with the tree.
+        """
+        live = set(self.collisions()) | set(self.shadowed())
+        return {
+            n: paths
+            for n, paths in self._dedupe_all().items()
+            if n not in live
+        }
+
+    def _dedupe_all(self):
+        seen = {}
+        for row in self.agents + self.skill_agents:
+            if not row["name"]:
+                continue
+            try:
+                key = os.path.realpath(row["path"])
+            except OSError:
+                key = row["path"]
+            seen.setdefault(row["name"], {})[key] = row["path"]
+        return {n: sorted(p.values()) for n, p in seen.items() if len(p) > 1}
+
+    def aliases(self):
+        """Distinct paths resolving to one file — reported, never a collision."""
+        by_real = {}
+        for row in self.agents + self.skill_agents:
+            try:
+                by_real.setdefault(os.path.realpath(row["path"]), []).append(row["path"])
+            except OSError:
+                pass
+        return {r: p for r, p in by_real.items() if len(p) > 1}
+
+    # ── skills ───────────────────────────────────────────────────────────────
+    def census_skills(self):
+        """Every installed skill, by directory holding a SKILL.md.
+
+        Added 2026-08-03. The first real audit's opening banner said "46 skills
+        present" against an actual 45 — hand-counted in Step 1, five minutes before
+        Step 1b ran the census that exists so counts are not hand-derived. The count
+        was never wrong because anyone was careless; it was wrong because nothing
+        produced it. `conversion-taxonomy.md` already ships the rule to users:
+        "No count in this project is hand-derived."
+        """
+        base = os.path.join(self.root, ".agents", "skills")
+        if not os.path.isdir(base):
+            return
+        for entry in sorted(os.listdir(base)):
+            d = os.path.join(base, entry)
+            if os.path.isdir(d) and os.path.exists(os.path.join(d, "SKILL.md")):
+                self.skills.append(entry)
+
+    # ── markers ──────────────────────────────────────────────────────────────
+    def load_ignore(self):
+        """Declared corpus exclusions from `.censusignore`. Absent is the normal case.
+
+        WHY THIS EXISTS. MEASURED 2026-08-05 by the first `dev audit` against
+        claude-workforce itself: BOTH "unpaired markers (sweep hazards)" were
+        `fixtures/f9-half-migrated` and `fixtures/scripts/census-inverted` — corpora
+        BUILT TO BE MALFORMED so that this census can detect malformation. And of the
+        files carrying sacred blocks, 21 were in `fixtures/` against 21 outside it:
+        half the "user directives" in the tree were test data.
+
+        A test corpus is not project content. Extracting a fixture's sacred block as
+        though it were the user's own words, or freezing a deliberately-broken fixture
+        as a sweep hazard, is the census reporting on itself.
+
+        DECLARED, NEVER INFERRED. There is no heuristic here — no `fixtures/` default,
+        no guess from directory names. A project says what its corpus is, or says
+        nothing and everything is surveyed, which stays the normal case (Core Principle
+        5: absence is not a gap).
+
+        AND THE DANGEROUS DIRECTION IS UNDER-REPORTING, so every exclusion is COUNTED
+        and every pattern that matched nothing is NAMED. A silent exclusion is how a
+        census reports health it did not measure — the failure this script's own exit
+        codes were written against. A dead pattern is reported for the same reason a
+        dead check is: it looks like coverage and is not.
+        """
+        path = os.path.join(self.root, ".censusignore")
+        body = None
+        if os.path.isfile(path):
+            body = self.read(path)
+        if not body:
+            return
+        for raw in body.splitlines():
+            s = raw.split("#", 1)[0].strip()
+            if s:
+                self.ignore_patterns.append(s)
+
+    def ignored(self, path):
+        """True if `path` matches a declared pattern. Records which pattern hit.
+
+        PUBLIC, because it has consumers outside this file. `wf-conform` reads the
+        same declaration through it so that "what counts as project content" is
+        answered once; when it was private, that file grew its own directory-name
+        guess instead and the two disagreed.
+        """
+        if not self.ignore_patterns:
+            return False
+        rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+        for pat in self.ignore_patterns:
+            p = pat.rstrip("/")
+            if (fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(rel, p + "/*")
+                    or rel == p or rel.startswith(p + "/")):
+                self.ignore_hits[pat] = self.ignore_hits.get(pat, 0) + 1
+                return True
+        return False
+
+    def census_markers(self):
+        """Every marker family, and pairing.
+
+        An unpaired marker is a sweep hazard: a lone START means a removal pass has
+        no end boundary and takes the rest of the file with it. Report, never repair.
+        """
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", ".venv")]
+            for fn in filenames:
+                if not fn.endswith(".md"):
+                    continue
+                p = os.path.join(dirpath, fn)
+                if self.ignored(p):
+                    self.ignored_files += 1
+                    continue
+                body = self.read(p)
+                if body is None:
+                    continue
+                # ORDER MATTERS, so this walks rather than sums. `END … START`
+                # balances to 0 under +1/-1 arithmetic and is a REAL hazard: a sweep
+                # keyed on the opener finds no boundary and takes the rest of the file.
+                depth, opened = {}, {}
+                for m in MARKER_RX.finditer(body):
+                    fam, side = m.group(1).upper(), m.group(2).upper()
+                    self.markers[fam] = self.markers.get(fam, 0) + 1
+                    if side == "START":
+                        opened[fam] = opened.get(fam, 0) + 1
+                        depth[fam] = depth.get(fam, 0) + 1
+                    else:
+                        if opened.get(fam, 0) == 0:
+                            self.unpaired.append(
+                                {"file": p, "family": fam, "imbalance": "END before START"})
+                        else:
+                            opened[fam] -= 1
+                        depth[fam] = depth.get(fam, 0) - 1
+                for fam, d in depth.items():
+                    if d > 0:
+                        self.unpaired.append(
+                            {"file": p, "family": fam, "imbalance": f"{d} unclosed"}
+                        )
+                # WALK, do not count. Two constructs share the `origin:` prefix:
+                # a PAIRED block closed by `<!-- /origin -->`, and a SINGLE-LINE
+                # annotation with no close (skill-builder uses both — see
+                # `manifest.txt` § Vendored evaluator catalogs). Counting opens
+                # against closes cannot tell them apart and over-reports every
+                # annotation as a hazard.
+                #
+                # The only question that gates the sweep: does a SACRED block have
+                # a close before the next origin marker? An unterminated sacred
+                # span is where extraction takes the wrong bytes. A generator's
+                # annotation is not a hazard and is not counted as one.
+                sacred = unterminated = mentions = 0
+                sacred_lines = []
+                pending = False
+                for lineno, line in enumerate(body.splitlines(), 1):
+                    ls = line.strip()
+                    if ORIGIN_CLOSE.match(line):
+                        pending = False
+                    # BEFORE ORIGIN_OPEN, which is whitespace-tolerant and would
+                    # otherwise claim the line and report 0 mentions forever.
+                    elif IMMUTABLE_MENTION.match(line):
+                        mentions += 1          # indented: an example, not an opener
+                    elif ORIGIN_OPEN.match(line):
+                        if pending:
+                            unterminated += 1      # a sacred open, then another open
+                        is_sacred = bool(IMMUTABLE_OPEN.match(line))
+                        sacred += is_sacred
+                        # The LINE, not just the count. An extraction record cites
+                        # `file:line`, so a coverage check that has only a total can
+                        # compare two numbers and never tell WHICH span is missing.
+                        if is_sacred:
+                            sacred_lines.append(lineno)
+                        pending = is_sacred
+                if pending:
+                    unterminated += 1              # sacred open, EOF, no close
+                if sacred or unterminated or mentions:
+                    self.immutable_blocks.append(
+                        {"file": p, "sacred": sacred, "lines": sacred_lines,
+                         "mentions": mentions,
+                         "unterminated": unterminated, "paired": unterminated == 0}
+                    )
+
+    # ── hooks ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def shell_segments(raw):
+        """The commands in a shell line, in execution order, unwrapped.
+
+        ONE PRODUCER FOR THE OPERATOR GRAMMAR, and it exists because `shlex.split`
+        is a WORD splitter, not a shell parser. It knows nothing about `;`, `&&`,
+        `||`, `|` or `&`, so it fuses a trailing separator onto the preceding word.
+
+        MEASURED 2026-08-10, both directions, from one fixture pair:
+
+        - FALSE DEAD. `bash bin/real.sh; echo done` tokenized to `bin/real.sh;` —
+          semicolon included — which is not a path on any disk. `wf-checkrun`
+          reported a live script dead and exited 1 on a handbook whose check was
+          fine. Surfaced by a project audit that could not fix it from its own tree.
+        - SILENT MISS, and this is the worse half. `cd "$X" && bash bin/real.sh`
+          gave first token `cd`, no slash, UNDECIDABLE — so the real script was
+          never examined and a dead registration in that shape reports as nothing.
+          Under-reporting is the direction `load_ignore` is written against too.
+
+        `shlex.shlex(punctuation_chars=True)` is used rather than a regex split
+        because the separator must be recognised OUTSIDE quotes only: a regex over
+        the raw text severs `bash -c "a; b"` mid-string, and that inline-script
+        shape is the one `resolve_hook_command` must keep whole in order to refuse
+        it. Returns [] when the line does not lex — an unbalanced quote is
+        undecidable, never a guess.
+        """
+        lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        try:
+            tokens = list(lex)
+        except ValueError:
+            return []
+        segments, current = [], []
+        for t in tokens:
+            if t in (";", "&", "&&", "|", "||", "\n"):
+                if current:
+                    segments.append(current)
+                current = []
+                continue
+            # Grouping and redirection are not commands. `(bash bin/y.sh)` put `(`
+            # in the first position, which carries no slash and so read UNDECIDABLE.
+            if t in ("(", ")", "{", "}", ">", ">>", "<", ">&", "<&"):
+                continue
+            current.append(t)
+        if current:
+            segments.append(current)
+        return segments
+
+    def resolve_hook_command(self, cmd):
+        """The script a hook command would run, and whether it is on disk.
+
+        Returns (resolved_path, exists). BOTH ARE None WHEN THE COMMAND CANNOT BE
+        DECIDED -- an inline shell pipeline, a bare name found on PATH, anything
+        this cannot reduce to one file. An undecidable command is never reported
+        as dead: a false "dead wiring" row invites someone to delete a working
+        registration, which is worse than the silence this replaces.
+
+        Written 2026-08-04. This method's absence is why three dead registrations
+        in a real project survived a full audit unremarked -- `procedures/hooks.md`
+        declares a `dead wiring - command not on disk` count in its report block
+        and nothing computed it. The docstring below already promised "the
+        resolved command path" and no code resolved anything.
+        """
+        raw = (cmd or "").strip()
+        if not raw:
+            return None, None
+        # A WORKFORCE ROW IS RESOLVED BY THE ONE RESOLVER, in every form workforce writes,
+        # so this census, `wf-conform` and the settings heal cannot disagree about it.
+        wh = workforce_hook(raw, self.root)
+        if wh is not None:
+            return wh["path"], wh["exists"]
+
+        # THE FIRST DECIDABLE SEGMENT WINS, and the loop is the point. A line's
+        # leading segment is very often a `cd`, a `test -f`, or a `mkdir -p` — bare
+        # names on PATH, undecidable by design — and stopping there is what made the
+        # real script behind `&&` invisible. Later segments were never examined
+        # before this loop existed, so nothing that used to resolve stops resolving.
+        for tokens in self.shell_segments(raw):
+            resolved = self._resolve_segment(tokens)
+            if resolved is not None:
+                return resolved, os.path.exists(resolved)
+        return None, None
+
+    def undecidable_why(self, hook, cmd):
+        """Why a registration resolved to no file, in words a reader can act on.
+
+        A COUNT NAMES NOTHING. The census printed `1 undecidable` and stopped, so a
+        reader could neither find the registration nor tell a `type: agent` hook (no
+        command at all, correct) from a script path hidden behind a variable this
+        process cannot expand (possibly dead). MEASURED 2026-09-16 on a customer tree:
+        the one undecidable row was a user-scope `Stop` agent hook, and nothing said so.
+        The reason comes from the SAME segment grammar `resolve_hook_command` walks
+        (`_segment_verdict`), so the explanation and the verdict cannot disagree.
+        """
+        htype = (hook or {}).get("type") or "command"
+        if htype != "command":
+            return f"`type: {htype}` hook — it runs no command, so there is no script to find"
+        raw = (cmd or "").strip()
+        if not raw:
+            return "empty `command`"
+        segments = self.shell_segments(raw)
+        if not segments:
+            return "the command does not lex (unbalanced quote)"
+        whys = []
+        for tokens in segments:
+            why = self._segment_verdict(tokens)[1]
+            if why and why not in whys:
+                whys.append(why)
+        return "; ".join(whys) or "no segment names a script"
+
+    def _resolve_segment(self, tokens):
+        """The one file a single command runs, or None when it cannot be decided."""
+        return self._segment_verdict(tokens)[0]
+
+    def _segment_verdict(self, tokens):
+        """(path, None) for the one file a single command runs, or (None, why).
+
+        AN ENVIRONMENT PREFIX IS NOT THE COMMAND. `FOO=bar cmd` and `env FOO=bar cmd`
+        both run `cmd`; the assignments are shell grammar sitting in front of it.
+        MEASURED 2026-08-10 against a real project the moment segment-walking landed:
+        `printf '%s' '{...}' | CLAUDE_PROJECT_DIR=/home/… bash .claude/…/hook.sh`
+        reached segment two, whose first token was the ASSIGNMENT — and it carries a
+        slash, so it read as a path, resolved to nothing, and reported a live hook
+        dead. The pre-existing behaviour hid this by never reaching segment two at
+        all, which is why walking the segments had to bring the grammar with it.
+        """
+        while tokens and (ENV_ASSIGN_RX.match(tokens[0])
+                          or (tokens[0] == "env" and len(tokens) > 1)):
+            tokens = tokens[1:]
+        if not tokens:
+            return None, "only environment assignments, no command"
+        first = tokens[0]
+        # An interpreter invocation runs its script argument, not itself.
+        if os.path.basename(first) in _OPTION_GRAMMAR:
+            first, why = self._interpreter_operand(os.path.basename(first), tokens[1:])
+            if first is None:
+                return None, why
+
+        if "/" not in first:
+            # resolved via PATH; not ours to judge
+            return None, f"`{first}` is a bare name resolved on PATH"
+
+        path = first
+        for var in ("${CWF_PROJECT_DIR}", "$CWF_PROJECT_DIR"):
+            path = path.replace(var, self.root)
+        path = os.path.expandvars(os.path.expanduser(path))
+        if "$" in path:
+            # an env var this process cannot know
+            return None, f"`{first}` carries a variable this process cannot expand"
+        if not os.path.isabs(path):
+            path = os.path.join(self.root, path)
+        # NEVER NORMALISED LEXICALLY. `os.path.normpath` resolves `..` against the TEXT, so
+        # across a symlinked directory it names a different file than the shell runs and
+        # called a live row dead (review 1, #9). The kernel's own resolution, which
+        # `os.path.exists` uses on the joined path, is physically correct across links, and
+        # a `..` row is decided like any other — HEAD's behaviour for foreign rows, which
+        # refusing `..` outright had lost (review 3, L5).
+        return path, None
+
+    @staticmethod
+    def _interpreter_operand(interp, args):
+        """(script_token, None) for the file an interpreter runs, or (None, why).
+
+        THE OPTIONS BEFORE THE FIRST OPERAND DECIDE IT, not `args[0]` alone. Only an
+        exact `-c` or `-Command` in first position used to count as inline, so a
+        handbook Check `node -e "require('./lib/x.js')"` or `bash -ec 'test -f a.md'`
+        named its CODE as the script, found a slash in it, and reported a dead check
+        that blocked (found 2026-10-22 while fixing university--11). Walking the
+        leading options also skips their arguments, so `python3 -W ignore x.py` names
+        `x.py` and not `ignore`. Everything after the operand belongs to the script.
+        """
+        grammar = _OPTION_GRAMMAR[interp]
+        i, n = 0, len(args)
+        while i < n:
+            if args[i] == "--":
+                i += 1
+                break
+            consumed, why = grammar(interp, args[i])
+            if why:
+                return None, why
+            if consumed == 0:
+                break
+            if consumed == _END:
+                i += 1
+                break
+            i += consumed
+        if i >= n:
+            return None, f"`{interp}` with no script argument"
+        return args[i], None
+
+    def owning_skill(self, resolved):
+        """Which skill directory this hook's script lives in, exactly.
+
+        `sweep` step 5 must relocate the hooks belonging to THE TARGET it is about
+        to unlink, and that is a per-skill question. The `in_skill_dir` flag beside
+        it is a global boolean derived from a substring of the command text, which
+        answers "some skill, probably" and cannot answer "this one."
+
+        Returns the skill NAME, or None when the path is outside `.claude/skills/`
+        or the command was undecidable. Compares real paths, so a symlinked skill
+        directory still reports its true owner.
+        """
+        if not resolved:
+            return None
+        base = os.path.realpath(os.path.join(self.root, ".agents", "skills"))
+        target = os.path.realpath(resolved)
+        if not target.startswith(base + os.sep):
+            return None
+        rest = target[len(base) + 1:].split(os.sep)
+        return rest[0] if rest and rest[0] else None
+
+    def census_hooks(self):
+        """Wired hooks from both settings scopes, with the resolved command path.
+
+        A hook whose command lands inside a skill directory is the case that
+        matters: removing that skill takes a live safety mechanism with it.
+        """
+        scopes = [(os.path.join(self.root, r), r) for r in
+                  (".codex/settings.json", ".codex/settings.local.json")]
+        _user_settings = os.path.join(config_root(), "settings.json")
+        scopes.append((_user_settings, _user_settings))
+        for p, rel in scopes:
+            if not os.path.exists(p):
+                continue
+            body = self.read(p)
+            if body is None:
+                continue
+            try:
+                cfg = json.loads(body)
+            except json.JSONDecodeError as exc:
+                self.unreadable.append((p, f"JSONDecodeError: {exc.msg}"))
+                continue
+            for event, entries in (cfg.get("hooks") or {}).items():
+                for entry in entries if isinstance(entries, list) else []:
+                    for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                        cmd = h.get("command", "")
+                        resolved, exists = self.resolve_hook_command(cmd)
+                        owner = self.owning_skill(resolved)
+                        why = (self.undecidable_why(h, cmd) if exists is None else None)
+                        self.hooks.append(
+                            {
+                                "settings": rel,
+                                "event": event,
+                                "matcher": entry.get("matcher"),
+                                "command": cmd,
+                                # Resolution-based when the command is decidable;
+                                # the substring is a fallback for the rest and is
+                                # advisory only.
+                                "in_skill_dir": (owner is not None if resolved
+                                                 else ".claude/skills/" in cmd),
+                                "skill": owner,
+                                "resolved": resolved,
+                                "exists": exists,
+                                # Set only when `exists` is None: which rule refused
+                                # to decide, so an undecidable row is named, not counted.
+                                "why": why,
+                                # The registration itself, so a remover can judge the
+                                # row it would delete (type, args) and not a summary.
+                                "hook": h,
+                            }
+                        )
+
+    # ── report ───────────────────────────────────────────────────────────────
+    def summary(self):
+        col = self.collisions()
+        return {
+            "root": self.root,
+            "skills": {"count": len(self.skills), "names": self.skills},
+            "agents": {
+                "project": sum(1 for a in self.agents if a["scope"] == "project"),
+                "personal": sum(1 for a in self.agents if a["scope"] == "personal"),
+                "in_skill": len(self.skill_agents),
+                "symlinks": sum(1 for a in self.agents if a["is_symlink"]),
+                "dangling": sum(1 for a in self.agents if a["dangling"]),
+            },
+            "collisions": col,
+            "duplicates": self.duplicates(),
+            "shadowed": self.shadowed(),
+            "ignored": {
+                "patterns": list(self.ignore_patterns),
+                "files": self.ignored_files,
+                "dead": [p for p in self.ignore_patterns if p not in self.ignore_hits],
+            },
+            "aliases": self.aliases(),
+            "namespace": self.namespace(),
+            "marker_families": dict(sorted(self.markers.items())),
+            "unpaired_markers": self.unpaired,
+            "immutable_blocks": {
+                "files": len([b for b in self.immutable_blocks if b["sacred"]]),
+                "blocks": sum(b["sacred"] for b in self.immutable_blocks),
+                "mentions": sum(b.get("mentions", 0) for b in self.immutable_blocks),
+                "unterminated": sum(b["unterminated"] for b in self.immutable_blocks),
+                "unpaired": [b for b in self.immutable_blocks if not b["paired"]],
+                # PER-FILE, WITH LINE NUMBERS, BECAUSE THE AGGREGATE ANSWERS THE WRONG
+                # QUESTION. The extraction gate is tree-wide (`N of N spans`) and one
+                # consumer is not: T2 for a removal target asks whether every sacred
+                # span INSIDE ONE DIRECTORY was extracted before that directory is
+                # unlinked. These records existed and were discarded here, so the only
+                # way to scope the count was a hand grep — which over-counted
+                # `skill-builder` 37 against the true 6 by matching indented examples
+                # and markers quoted mid-line, and left a real gate unsettled for a
+                # day. A census whose scope cannot be narrowed is re-derived by hand,
+                # and `bin/baseline`'s own docstring says what hand counts are worth.
+                "by_file": sorted(
+                    ({"file": b["file"], "sacred": b["sacred"],
+                      "lines": b.get("lines", []), "mentions": b["mentions"],
+                      "unterminated": b["unterminated"]}
+                     for b in self.immutable_blocks if b["sacred"]),
+                    key=lambda b: b["file"]),
+            },
+            "hooks": self.hooks,
+            "unreadable": self.unreadable,
+        }
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wf-census")
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--json", dest="json_path")
+    ap.add_argument("--manifest", dest="manifest_path")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    # AN EMPTY --root IS A CALLER ERROR, NEVER A SILENT RETARGET TO CWD.
+    # `${CLAUDE_PROJECT_DIR}` is UNSET in the Bash tool — measured 2026-08-04 on
+    # 2.1.221 — so every shipped `--root "${CLAUDE_PROJECT_DIR}"` block expands to
+    # `--root ""`. `os.path.abspath("")` is the CWD, which is a real directory, so a
+    # is-it-a-directory guard passes and the tool examines a tree nobody named.
+    # Measured: `wf-conform --root ""` in an empty dir exited 0 reporting
+    # "0 governed · 0 failed" — a validator reporting health it never measured, which
+    # is the exact contract procedures/verify.md states five lines under the block
+    # that produces it.
+    if not (args.root or "").strip():
+        print("wf-census: --root is empty. ${CLAUDE_PROJECT_DIR} is unset outside a "
+              "hook; pass an explicit path.", file=sys.stderr)
+        return 2
+
+    if not os.path.isdir(args.root):
+        print(f"wf-census: not a directory: {args.root}", file=sys.stderr)
+        return 2
+
+    c = Census(args.root)
+    c.load_ignore()
+    c.census_agents()
+    c.census_skills()
+    c.census_markers()
+    c.census_hooks()
+    s = c.summary()
+
+    if args.json_path:
+        with open(args.json_path, "w", encoding="utf-8") as fh:
+            json.dump(s, fh, indent=2, sort_keys=True)
+
+    if args.manifest_path:
+        with open(args.manifest_path, "w", encoding="utf-8") as fh:
+            fh.write("# agent registry census — kind, link, resolved, owner, dangling\n")
+            for a in c.agents + c.skill_agents:
+                fh.write(
+                    "\t".join(
+                        [
+                            "symlink" if a["is_symlink"] else "file",
+                            a["path"],
+                            a["link_target"] or "-",
+                            a["resolved"] or "-",
+                            a["scope"],
+                            a["name"] or "(no name:)",
+                            "DANGLING" if a["dangling"] else "ok",
+                        ]
+                    )
+                    + "\n"
+                )
+
+    if not args.quiet:
+        ag = s["agents"]
+        # THE TITLE LINE FIRST, and every body row under it. A row printed above the
+        # header names no tree: `skills 4 installed` with the root on the NEXT line
+        # reads as a count of something the reader has not been told the scope of.
+        # Introduced by appending a row at the wrong offset (26ec383) and invisible in
+        # a diff, because both lines are correct in isolation and only their ORDER is
+        # wrong — the class of defect a fixture catches and a review does not.
+        print(f"wf-census — {s['root']}")
+        # Always all counts, including the zeroes. A zero is a measurement;
+        # silence is not.
+        print(f"  skills      {s['skills']['count']} installed")
+        print(
+            f"  agents      {ag['project']} project · {ag['personal']} personal · "
+            f"{ag['in_skill']} in-skill · {ag['symlinks']} symlinks · {ag['dangling']} dangling"
+        )
+        print(
+            f"  markers     {len(s['marker_families'])} families · "
+            f"{sum(s['marker_families'].values())} markers · "
+            f"{len(s['unpaired_markers'])} unpaired (sweep hazards)"
+        )
+        ib = s["immutable_blocks"]
+        print(
+            f"  immutable   {ib['blocks']} sacred blocks in {ib['files']} files · "
+            f"{ib['unterminated']} unterminated (extraction hazards) · "
+            f"{ib['mentions']} indented mention(s) not counted"
+        )
+        _dead = [h for h in s['hooks'] if h.get('exists') is False]
+        _unknown = sum(1 for h in s['hooks'] if h.get('exists') is None)
+        print(f"  hooks       {len(s['hooks'])} wired · "
+              f"{sum(1 for h in s['hooks'] if h['in_skill_dir'])} inside a skill dir · "
+              f"{len(_dead)} dead · {_unknown} undecidable")
+        # A dead registration is named, never just counted: the whole point is
+        # that someone can act on it, and `3 dead` is not actionable.
+        for h in _dead:
+            print(f"                DEAD  {h['event']:<14} {h['resolved']}")
+        # So is an undecidable one, with the rule that refused it. `1 undecidable` alone
+        # could not tell an agent hook (fine) from a path behind a variable (maybe dead).
+        for h in s['hooks']:
+            if h.get('exists') is None:
+                print(f"                UNDECIDABLE  {h['event']:<14} {h['settings']} — "
+                      f"{h.get('why') or 'no reason recorded'}")
+        print(f"  aliases     {len(s['aliases'])} file(s) reachable by >1 path (symlinks — not collisions)")
+        print(f"  namespace   {len(s['namespace'])} in-skill template name(s) shared "
+              f"(advisory — loaded by path, not resolved by name)")
+        _ig = s["ignored"]
+        if _ig["patterns"]:
+            print(f"  excluded    {_ig['files']} file(s) by {len(_ig['patterns'])} declared "
+                  f"pattern(s) in .censusignore")
+            for _p in _ig["patterns"]:
+                print(f"    · {_p}")
+            # A pattern matching nothing looks like coverage and is not — the same
+            # reason a dead check is reported rather than counted as one.
+            for _p in _ig["dead"]:
+                print(f"    ! DEAD pattern (matched nothing): {_p}")
+        print(f"  duplicates  {len(s['duplicates'])} name(s) installed in BOTH scopes, "
+              f"byte-identical (advisory — same behaviour whichever resolves)")
+        # SORTED, EVERY ONE OF THEM. These maps and lists are filled in `os.walk` order, so
+        # their row order follows the directory entries of whatever tree is being read — and a
+        # fresh copy of one tree enumerates in a different order than the original. MEASURED
+        # 2026-09-25 by `bin/corpus`, which runs this against a copy of a real org and compares
+        # against a golden: `image-validator` and `character-scanner` swapped places between two
+        # runs of the SAME unchanged tree, as did the two `unreadable` rows. `audit.md` Step 7
+        # rests on comparing one run's report with another's — "comparing two runs is the only
+        # way to tell whether a change helped" — and a report whose rows move on their own makes
+        # every such comparison a diff of noise.
+        for name, paths in report_rows(s["duplicates"]):
+            print(f"    · {name}: {', '.join(paths)}")
+        print(f"  shadowed    {len(s['shadowed'])} name(s) registered in BOTH scopes and "
+              f"DIFFERING (advisory — one copy per scope; remove the one you do not want)")
+        for name, paths in report_rows(s["shadowed"]):
+            print(f"    · {name}: {', '.join(paths)}")
+        print(f"  collisions  {len(s['collisions'])} live (one scope, resolving locations only)")
+        for name, paths in report_rows(s["collisions"]):
+            print(f"    ! {name}: {', '.join(paths)}")
+        for name, paths in report_rows(s["namespace"]):
+            print(f"    · {name}: {len(paths)} in-skill copies — advisory; workforce "
+                  f"may not claim this name")
+        for f in report_rows(s["unpaired_markers"], key=lambda r: (r["file"], r["family"])):
+            print(f"    ! unpaired {f['family']} in {f['file']} (imbalance {f['imbalance']})")
+        for p, why in report_rows(s["unreadable"]):
+            print(f"    ! unreadable {p}: {why}")
+
+    # A collision is blocking: it resolves silently by read order, so a run that
+    # continues past one has registered an employee that may never load.
+    return 2 if (s["collisions"] or s["unreadable"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

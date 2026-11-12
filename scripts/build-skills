@@ -1,62 +1,360 @@
 #!/usr/bin/env python3
-"""Generate the Codex skill copies in .agents/skills/ from upstream/claude-workforce.
+"""Generate Codex skill copies and custom-agent TOMLs from upstream/claude-workforce.
 
-Each skill gets the cwf- prefix so it stays apart from claude-workforce's copies. Claude-only
-frontmatter keys are dropped, and listed text replacements are applied. A replacement whose
-source text is no longer in upstream fails the build, so a re-sync can't silently leave Claude
-terms behind.
+Every shipped skill is copied in full: its SKILL.md plus references, scripts and bundled
+agents. Each gets the cwf- prefix so it stays apart from claude-workforce's copies. The nine
+employee handbooks become Codex TOML under cwf/agents/.
+Claude-only frontmatter keys are dropped, host-specific paths and invocations are replaced,
+and a replacement whose source text is no longer in upstream fails the build, so a re-sync
+can't silently leave Claude terms behind.
 
 Usage: scripts/build-skills        (run after scripts/sync-upstream)
 """
+import json
 import os
 import re
+import shutil
 import sys
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UP = os.path.join(ROOT, "upstream", "claude-workforce", "workforce", "skills")
 OUT = os.path.join(ROOT, ".agents", "skills")
+AGENT_OUT = os.path.join(ROOT, "cwf", "agents")
+BIN_OUT = os.path.join(ROOT, "cwf", "bin")
+# Upstream scripts the shipped skills call by path. They are copied out of the
+# checksum-pinned tree and rewritten for Codex state paths, like the skills themselves.
+SKILL_BINS = ("wf-code-eval", "wf-map", "wf-census")
 
 # Frontmatter keys the agentskills.io standard defines; everything else is dropped.
 KEEP_KEYS = {"name", "description", "license", "compatibility", "metadata"}
+SKILLS = ("blueprint", "code-evaluator", "records-code-map", "security-evaluator",
+          "shared-artifact", "text-eval", "timezone", "ui-design")
+# Upstream handbooks that are workforce employees rather than skill-bundled advisors.
+WORKFORCE_AGENTS = ("content-classifier", "conversion-auditor", "doctrine-auditor",
+                    "handbook-cold-reader", "headcount-skeptic", "provenance-analyst",
+                    "settings-scout")
 
-SKILLS = {
-    "blueprint": [
-        ("plan/  docs/plans/  .claude/plans/  notes/plans/  docs/plan/",
-         "plan/  docs/plans/  .codex-workforce/plans/  notes/plans/  docs/plan/"),
+# Text every copied file gets. Ordering matters: the long script resolver forms first.
+COMMON = [
+    # Resolve the package install from the project or CODEX_HOME. Generated skills stay
+    # under <skills-root>; backlog scripts live in the install's cwf-<name> copy.
+    ('WF="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/workforce"; [ -d "$WF" ] '
+     '|| WF="${CLAUDE_PROJECT_DIR}/.claude/skills/workforce"',
+     'WF="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}"; '
+     '[ -d "$WF" ] || WF="${CODEX_HOME:-$HOME/.codex}/codex-workforce"'),
+    ('TZB="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/timezone/bin/wf-timezone"; '
+     '[ -x "$TZB" ] || TZB="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/timezone/bin/wf-timezone"',
+     'TZB="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}/cwf-timezone/bin/wf-timezone"; '
+     '[ -x "$TZB" ] || TZB="${CODEX_HOME:-$HOME/.codex}/codex-workforce/cwf-timezone/bin/wf-timezone"'),
+    ('TS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/text-eval/bin/wf-text-scan"; '
+     '[ -x "$TS" ] || TS="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/text-eval/bin/wf-text-scan"',
+     'TS="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}/cwf-text-eval/bin/wf-text-scan"; '
+     '[ -x "$TS" ] || TS="${CODEX_HOME:-$HOME/.codex}/codex-workforce/cwf-text-eval/bin/wf-text-scan"'),
+    # The install root holds the package under cwf/, so a skill's `$WF/bin/...`
+    # must name `$WF/cwf/bin/...`. Both bundled skills say `$WF/bin` verbatim.
+    ('"$WF/bin/wf-code-eval"', '"$WF/cwf/bin/wf-code-eval"'),
+    ('`"$WF/bin/wf-code-eval"`', '`"$WF/cwf/bin/wf-code-eval"`'),
+    ('"$WF/bin/wf-map"', '"$WF/cwf/bin/wf-map"'),
+    ('`workforce/bin/wf-map`', '`cwf/bin/wf-map`'),
+    ('`<skills-root>/workforce/bin/wf-map`', '`<install-root>/cwf/bin/wf-map`'),
+    ("In this distribution's own repository the script is at `workforce/bin/wf-map`.",
+     "In this distribution's own repository the script is at `cwf/bin/wf-map`."),
+    # Invocation syntax. Codex uses `$skill`, and the generated names carry cwf-.
+    # The pre-write advisor is a Codex custom agent, which lives at .codex/agents/*.toml.
+    # State and project paths.
+    (".claude/workforce/work/", ".codex-workforce/work/"),
+    (".claude/workforce/", ".codex-workforce/"),
+    (".claude/design/", ".codex-workforce/design/"),
+    (".claude/plans/", ".codex-workforce/plans/"),
+    (".claude/.code-eval-reviewed", ".codex-workforce/.code-eval-reviewed"),
+    (".claude/.code-eval-active", ".codex-workforce/.code-eval-active"),
+    (".claude/.code-eval-advised", ".codex-workforce/.code-eval-advised"),
+    (".claude/skills/text-eval/CATALOG-ANCHOR.md",
+     ".agents/skills/cwf-text-eval/CATALOG-ANCHOR.md"),
+    ('`CLAUDE.md`', '`AGENTS.md`'), ('"CLAUDE.md"', '"AGENTS.md"'),
+    ('.claude/agents/**', '.codex/agents/**'),
+    # Claude-only wordings.
+    ("One `AskUserQuestion` call", "one plain-text question"),
+    ("`AskUserQuestion`", "a plain-text question"),
+    ("AskUserQuestion", "plain-text question"),
+    ("`ArtifactComments` tool in its `read` action; load it through `ToolSearch` first when it is deferred rather than present",
+     "artifact/comment tool available in the session"),
+    ("`ArtifactComments`", "the artifact comment tool"),
+    ("`ToolSearch`", "the tool search"),
+    ("Run it as a Task agent.", "Run it in an isolated subagent."),
+    ("as a Task agent with `context: none`", "in an isolated subagent with no parent context"),
+    ("CLAUDE_PROJECT_DIR", "CWF_PROJECT_DIR"),
+    ("Claude Code's", "Codex's"),
+    ("Claude Code", "Codex"),
+    ("Claude's", "Codex's"), ("Claude runs", "Codex runs"),
+    ("${CLAUDE_CONFIG_DIR:-~/.claude}", "${CODEX_HOME:-~/.codex}"),
+    ("${CLAUDE_CONFIG_DIR:-$HOME/.claude}", "${CODEX_HOME:-$HOME/.codex}"),
+    ('/home/you/.claude/skills/timezone', '<CODEX_HOME>/codex-workforce/cwf-timezone'),
+    ('os.path.join(".claude", "skills", "text-eval", "CATALOG-ANCHOR.md")',
+     'os.path.join(".agents", "skills", "cwf-text-eval", "CATALOG-ANCHOR.md")'),
+    ('os.path.join(root, ".claude", name)', 'os.path.join(root, ".codex", name)'),
+    ('.claude/skills/text-eval/CATALOG-ANCHOR.md',
+     '.agents/skills/cwf-text-eval/CATALOG-ANCHOR.md'),
+    ("claude.ai Artifact", "shared HTML artifact"),
+    ("Claude Docs", "a shared document service"),
+    ("a docs skill", "a document skill"),
+    ("`code-design-advisor` agent", "code-design advisor custom agent, defined in `.codex/agents/code-design-advisor.toml`"),
+    ("`deadcode-gardener` agent", "dead-code gardener custom agent (`deadcode-gardener`, defined in `.codex/agents/deadcode-gardener.toml`)"),
+]
+
+# Scripts whose own path constants must move into the generated tree.
+SCRIPT_REPLACEMENTS = {
+    "bin/wf-text-scan": [
+        ("${CLAUDE_PROJECT_DIR:-$PWD}", "${CWF_PROJECT_DIR:-$PWD}"),
+        ("$CLAUDE_PROJECT_DIR", "$CWF_PROJECT_DIR"),
+        ('.claude/skills/text-eval/CATALOG-ANCHOR.md',
+         '.agents/skills/cwf-text-eval/CATALOG-ANCHOR.md'),
+        ('os.path.join(".claude", "skills", "text-eval", "CATALOG-ANCHOR.md")',
+         'os.path.join(".agents", "skills", "cwf-text-eval", "CATALOG-ANCHOR.md")'),
+    ],
+    "bin/wf-timezone": [
+        ("${CLAUDE_CONFIG_DIR:-~/.claude}", "${CODEX_HOME:-~/.codex}"),
+        ("$CLAUDE_PROJECT_DIR", "$CWF_PROJECT_DIR"),
+        ('os.path.join(root, ".claude", name)', 'os.path.join(root, ".codex", name)'),
+    ],
+}
+# Standalone scripts in cwf/bin/, rewritten before they are installed.
+BIN_REPLACEMENTS = {
+    "wf-code-eval": [
+        (".claude/.code-eval-reviewed", ".codex-workforce/.code-eval-reviewed"),
+        ('os.path.join(root, ".claude", MARKER)', 'os.path.join(root, ".codex-workforce", MARKER)'),
+        ('os.path.join(root, ".claude", name)', 'os.path.join(root, ".codex-workforce", name)'),
+        ('os.path.join(root, ".claude", ACTIVE)', 'os.path.join(root, ".codex-workforce", ACTIVE)'),
+        ('os.path.join(root, ".claude", "settings.local.json")',
+         'os.path.join(root, ".codex", "settings.local.json")'),
+        ('os.path.join(root, ".claude", "settings.json")',
+         'os.path.join(root, ".codex", "settings.json")'),
+        ('os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")',
+         'os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")'),
+        ('env = dict(os.environ, CLAUDE_PROJECT_DIR=root)',
+         'env = dict(os.environ, CWF_PROJECT_DIR=root)'),
+        ('os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()',
+         'os.environ.get("CWF_PROJECT_DIR") or os.getcwd()'),
+        ("the hash in `.claude/.code-eval-reviewed`", "the hash in `.codex-workforce/.code-eval-reviewed`"),
+    ],
+    "wf-map": [
+        ('os.path.join(root, ".claude", "agents")',
+         'os.path.join(root, ".codex", "agents")'),
+        ('os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()',
+         'os.environ.get("CWF_PROJECT_DIR") or os.getcwd()'),
+        ("default `$CLAUDE_PROJECT_DIR`", "default `$CWF_PROJECT_DIR`"),
+    ],
+    # wf-census is loaded by wf-code-eval to resolve hook commands. Only the paths that
+    # decide which hooks and agents exist need the Codex names; its other checks are not
+    # reachable from the shipped code-eval coordinate path.
+    "wf-census": [
+        ('os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")',
+         'os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")'),
+        ('${CLAUDE_CONFIG_DIR:-$HOME/.claude}', '${CODEX_HOME:-$HOME/.codex}'),
+        ('("${CLAUDE_PROJECT_DIR}", "project"), ("$CLAUDE_PROJECT_DIR", "project"),',
+         '("${CWF_PROJECT_DIR}", "project"), ("$CWF_PROJECT_DIR", "project"),'),
+        ('for var in ("${CLAUDE_PROJECT_DIR}", "$CLAUDE_PROJECT_DIR"):',
+         'for var in ("${CWF_PROJECT_DIR}", "$CWF_PROJECT_DIR"):'),
+        ('os.path.join(self.root, ".claude", "agents")',
+         'os.path.join(self.root, ".codex", "agents")'),
+        ('os.path.join(self.root, ".claude", "skills")',
+         'os.path.join(self.root, ".agents", "skills")'),
+        ('os.path.realpath(os.path.join(self.root, ".claude", "skills"))',
+         'os.path.realpath(os.path.join(self.root, ".agents", "skills"))'),
+        ('os.path.join(root, ".claude", "settings.local.json")',
+         'os.path.join(root, ".codex", "settings.local.json")'),
+        ('os.path.join(root, ".claude", "settings.json")',
+         'os.path.join(root, ".codex", "settings.json")'),
+        ('(".claude/settings.json", ".claude/settings.local.json")',
+         '(".codex/settings.json", ".codex/settings.local.json")'),
     ],
 }
 
 
-def build(name, replacements):
-    with open(os.path.join(UP, name, "SKILL.md"), encoding="utf-8") as fh:
-        text = fh.read()
+def frontmatter_split(text):
     m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
     if not m:
-        raise SystemExit(f"{name}: no frontmatter")
-    lines = []
-    for line in m.group(1).splitlines():
-        key = line.split(":", 1)[0].strip()
-        if key == "name":
-            lines.append(f"name: cwf-{name}")
-        elif key in KEEP_KEYS:
-            lines.append(line)
-    body = text[m.end():]
+        raise SystemExit("no frontmatter")
+    return m.group(1), text[m.end():]
+
+
+def rewrite(name, rel, text):
+    replacements = list(COMMON) + SCRIPT_REPLACEMENTS.get(rel, [])
     for old, new in replacements:
-        if old not in body:
-            raise SystemExit(f"{name}: upstream no longer contains {old[:50]!r}; update scripts/build-skills")
-        body = body.replace(old, new)
-    note = (f"\n<!-- Generated by scripts/build-skills from upstream/claude-workforce/workforce/"
-            f"skills/{name}/SKILL.md. Edit the generator, not this file. -->\n")
+        text = text.replace(old, new)
+    text = text.replace("the the ", "the ").replace(" the the ", " the ").replace("a a ", "a ").replace(" a a ", " a ")
+    # A generated file may not retain Claude's command namespace.
+    if rel == "SKILL.md":
+        head, body = frontmatter_split(text)
+        lines = []
+        for line in head.splitlines():
+            key = line.split(":", 1)[0].strip()
+            if key == "name":
+                lines.append(f"name: cwf-{name}")
+            elif key in KEEP_KEYS:
+                lines.append(line)
+        for cmd in ("blueprint", "code-evaluator", "records-code-map", "security-evaluator",
+                    "shared-artifact", "text-eval", "timezone", "ui-design"):
+            body = re.sub(r"(?<!\\$)/" + re.escape(cmd) + r"\b", "$cwf-" + cmd, body)
+        note = (f"\n<!-- Generated by scripts/build-skills from upstream/claude-workforce/workforce/"
+                f"skills/{name}. Edit the generator, not this file. -->\n")
+        text = "---\n" + "\n".join(lines) + "\n---\n" + note + body
+    return text
+
+
+def parse_frontmatter(text):
+    head, body = frontmatter_split(text)
+    fields = {}
+    for line in head.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fields[k.strip()] = v.strip().strip('"').strip("'")
+    return fields, body
+
+
+def rewrite_agent_text(text):
+    """Host paths and variables inside an AGENT.md handbook."""
+    replacements = [
+        (".claude/settings.local.json", ".codex/settings.local.json"),
+        (".claude/settings.json", ".codex/settings.json"),
+        (".claude/settings*.json", ".codex/settings*.json"),
+        (".claude/settings", ".codex/settings"),
+        (".claude/agents/**", ".codex/agents/**"),
+        (".claude/workforce/", ".codex-workforce/"),
+        (".claude/**", ".codex/**"),
+        (".claude/", ".codex/"),
+        (".claude ", ".codex "),
+        ("CLAUDE_PROJECT_DIR", "CWF_PROJECT_DIR"),
+        ("Claude Code's", "Codex's"),
+        ("Claude Code", "Codex"),
+        ("the `claude` CLI", "the Codex CLI"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+def build_agent(src, slug, out_path):
+    """One upstream AGENT.md -> Codex TOML. The body is the verbatim handbook, with a
+    host-limits paragraph beside it; the Claude tool keys are not represented as
+    enforcement, because Codex has none."""
+    text = rewrite_agent_text(open(src, encoding="utf-8").read())
+    fields, body = parse_frontmatter(text)
+    name = fields.get("name") or slug.replace("-", "_")
+    desc = fields.get("description") or ""
+    effort = fields.get("effort") or ""
+    # The upstream agent names carry the wf- namespace; Codex's built-ins and the
+    # generated skill rows use cwf-. Keep the name stable and collision-free.
+    codex_name = "cwf-" + name[len("wf-"):] if name.startswith("wf-") else name
+    out = [
+        f'name = {json.dumps(codex_name)}',
+        f'description = {json.dumps(desc)}',
+    ]
+    if effort:
+        out.append(f'model_reasoning_effort = "{effort}"')
+    notes = ("Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or "
+             "`disallowedTools:`. The upstream definition named "
+             f"`{fields.get('tools', '(none)')}` and `{fields.get('disallowedTools', '(none)')}`; "
+             "treat those as instructions and detection, never as host enforcement.")
+    out.append('developer_instructions = """\n' + notes + "\n\n" + body.strip() + '\n"""')
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out) + "\n")
+    return path
+
+
+def build(name):
+    src = os.path.join(UP, name)
+    if not os.path.isdir(src):
+        raise SystemExit(f"{name}: upstream skill directory is missing")
     dest = os.path.join(OUT, f"cwf-{name}")
-    os.makedirs(dest, exist_ok=True)
-    with open(os.path.join(dest, "SKILL.md"), "w", encoding="utf-8") as fh:
-        fh.write("---\n" + "\n".join(lines) + "\n---\n" + note + body)
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(src, dest)
+    for dirpath, _dirs, files in os.walk(dest):
+        for fn in files:
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, dest)
+            if fn in ("wf-text-scan", "wf-timezone"):
+                rel = "bin/" + fn
+            elif rel != "SKILL.md" and not fn.endswith((".md", ".html", ".py", ".txt")):
+                continue
+            try:
+                text = open(path, encoding="utf-8").read()
+            except UnicodeDecodeError:
+                continue
+            open(path, "w", encoding="utf-8").write(rewrite(name, rel, text))
     return os.path.join(dest, "SKILL.md")
 
 
+def build_bin(name):
+    src = os.path.join(ROOT, "upstream", "claude-workforce", "workforce", "bin", name)
+    if not os.path.isfile(src):
+        raise SystemExit(f"{name}: upstream script is missing; re-run sync-upstream")
+    text = open(src, encoding="utf-8").read()
+    for old, new in BIN_REPLACEMENTS.get(name, []):
+        text = text.replace(old, new)
+    path = Path(BIN_OUT, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def check():
+    """Fail the build if a Claude command or state path survived."""
+    bad = []
+    for name in SKILLS:
+        dest = os.path.join(OUT, f"cwf-{name}")
+        for dirpath, _dirs, files in os.walk(dest):
+            for fn in files:
+                path = os.path.join(dirpath, fn)
+                try:
+                    text = open(path, encoding="utf-8").read()
+                except UnicodeDecodeError:
+                    continue
+                for pat in (r"(?<!\\$)/blueprint\\b", r"(?<!\\$)/code-evaluator\\b",
+                            r"(?<!\\$)/text-eval\\b", r"\\.claude/"):
+                    if re.search(pat, text):
+                        bad.append(f"{os.path.relpath(path, ROOT)}: {pat}")
+    for name in SKILL_BINS:
+        path = os.path.join(BIN_OUT, name)
+        text = open(path, encoding="utf-8").read()
+        # wf-census carries a large unrelated audit surface whose provenance comments
+        # still name Claude paths. The executable codeeval path is covered by the run
+        # test; these literals are the executable state paths on the two entry points.
+        if name in ("wf-code-eval", "wf-map"):
+            for literal in ('".claude"', "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR"):
+                if literal in text:
+                    bad.append(f"{os.path.relpath(path, ROOT)}: {literal}")
+    if bad:
+        raise SystemExit("Claude-only references survived:\n" + "\n".join(bad))
+
+
 def main():
-    for name, reps in SKILLS.items():
-        print("built", os.path.relpath(build(name, reps), ROOT))
+    for name in SKILLS:
+        print("built", os.path.relpath(build(name), ROOT))
+    base = os.path.join(ROOT, "upstream", "claude-workforce", "workforce", "agents")
+    for slug in WORKFORCE_AGENTS:
+        src = os.path.join(base, slug, "AGENT.md")
+        if not os.path.isfile(src):
+            raise SystemExit(f"{slug}: upstream AGENT.md is missing; re-run sync-upstream")
+        print("built", os.path.relpath(build_agent(
+            src, slug, os.path.join(AGENT_OUT, slug + ".toml")), ROOT))
+    # The two skill-bundled advisors stay beside their skill source; Codex needs their
+    # TOML in `cwf/agents/`, which both installers copy to `.codex/agents/`.
+    bundled = os.path.join(UP, "code-evaluator", "agents")
+    for slug in ("code-design-advisor", "deadcode-gardener"):
+        src = os.path.join(bundled, slug, "AGENT.md")
+        if not os.path.isfile(src):
+            raise SystemExit(f"{slug}: bundled AGENT.md is missing")
+        print("built", os.path.relpath(build_agent(
+            src, slug, os.path.join(AGENT_OUT, slug + ".toml")), ROOT))
+    for name in SKILL_BINS:
+        print("built", os.path.relpath(build_bin(name), ROOT))
+    check()
+    print(json.dumps({"skills": len(SKILLS), "agents": 9, "bins": len(SKILL_BINS)},
+                     separators=(",", ":")))
     return 0
 
 

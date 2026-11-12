@@ -21,6 +21,11 @@ def manifest():
         return [l.strip() for l in fh if l.strip() and not l.startswith("#")]
 
 
+def version():
+    with open(os.path.join(ROOT, "VERSION")) as fh:
+        return fh.read().strip()
+
+
 class ManifestTests(unittest.TestCase):
     def test_every_manifest_path_exists(self):
         for p in manifest():
@@ -28,15 +33,16 @@ class ManifestTests(unittest.TestCase):
 
     def test_every_runtime_file_is_in_the_manifest(self):
         listed = set(manifest())
-        # upstream's skills/ is build input for scripts/build-skills, not runtime; the
-        # generated .agents/skills copies are what ship.
-        build_only = os.path.join("upstream", "claude-workforce", "workforce", "skills")
+        # upstream's skills/ and agents/ are build input for scripts/build-skills, not
+        # runtime; the generated .agents/skills and cwf/agents copies are what ship.
+        build_only = (os.path.join("upstream", "claude-workforce", "workforce", "skills"),
+                      os.path.join("upstream", "claude-workforce", "workforce", "agents"))
         for top in ("cwf", "upstream", ".agents/skills"):
             for dirpath, dirs, files in os.walk(os.path.join(ROOT, top)):
                 dirs[:] = [d for d in dirs if d != "__pycache__"]
                 for f in files:
                     rel = os.path.relpath(os.path.join(dirpath, f), ROOT)
-                    if rel.startswith(build_only):
+                    if any(rel.startswith(b) for b in build_only):
                         continue
                     self.assertIn(rel, listed, f"{rel} ships nowhere: add it to manifest.txt")
 
@@ -80,14 +86,22 @@ class InstallerTests(unittest.TestCase):
     def test_user_install_update_and_uninstall(self):
         r = self.run_install("--user")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("installed 0.1.1 (user scope)", r.stdout)
+        self.assertIn("installed " + version()
+                      + " (user scope)", r.stdout)
         inst = os.path.join(self.codex, "codex-workforce")
         for p in manifest():
             if not p.startswith(".agents/"):
                 self.assertTrue(os.path.isfile(os.path.join(inst, p)), p)
+        # The agent TOMLs are promoted out of the install tree; the README stays with
+        # the package so the source of truth is explained beside them.
+        self.assertTrue(os.path.isfile(os.path.join(inst, "cwf", "agents", "README.md")))
         self.assertTrue(os.path.isfile(os.path.join(inst, "RESUME.md")),
                         "the resume handoff must ship with the install")
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".agents/skills/cwf-blueprint/SKILL.md")))
+        agent_dest = os.path.join(self.codex, "agents", "content-classifier.toml")
+        self.assertTrue(os.path.isfile(agent_dest))
+        with open(agent_dest, encoding="utf-8") as fh:
+            self.assertIn('name = "cwf-content-classifier"', fh.read())
         hooks = self.hooks(self.codex)
         self.assertEqual(hooks["SessionStart"][0]["hooks"][0], self.other)
         self.assertEqual(len(self.cwf_handlers(hooks)), 4)
@@ -96,16 +110,21 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, ".claude")))
 
         again = self.run_install("--user")
-        self.assertIn("reinstalled 0.1.1", again.stdout)
+        self.assertIn("reinstalled " + version(), again.stdout)
         self.assertEqual(len(self.cwf_handlers(self.hooks(self.codex))), 4, "no duplicate hooks")
 
         mine = os.path.join(self.home, ".agents/skills/cwf-mine")
         os.makedirs(mine)
+        mine_agent = os.path.join(self.codex, "agents", "mine.toml")
+        with open(mine_agent, "w") as fh:
+            fh.write('name = "mine"\n')
         gone = self.run_install("--user", "--uninstall")
         self.assertEqual(gone.returncode, 0, gone.stderr)
         self.assertFalse(os.path.exists(inst))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".agents/skills/cwf-blueprint")))
         self.assertTrue(os.path.isdir(mine), "uninstall removed a skill it did not install")
+        self.assertFalse(os.path.exists(os.path.join(self.codex, "agents", "content-classifier.toml")))
+        self.assertTrue(os.path.isfile(mine_agent), "uninstall removed an agent it did not install")
         self.assertEqual(self.hooks(self.codex), {"SessionStart": [{"hooks": [self.other]}]})
 
     def test_installed_hook_runs(self):
@@ -133,13 +152,23 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(victim, "keep")), "uninstall escaped the skills folder")
 
+    def test_tampered_agent_list_cannot_delete_outside_agent_dir(self):
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        victim = os.path.join(self.home, "victim-agent")
+        os.makedirs(victim)
+        with open(os.path.join(self.codex, "codex-workforce", "installed-agents.txt"), "a") as fh:
+            fh.write("../victim-agent/keep.toml\n../../victim-agent/keep.toml\n")
+        r = self.run_install("--user", "--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isdir(victim), "uninstall escaped the agents folder")
+
     def test_downgrade_is_refused_without_force(self):
         self.assertEqual(self.run_install("--user").returncode, 0)
         with open(os.path.join(self.codex, "codex-workforce", "VERSION"), "w") as fh:
             fh.write("9.9.9\n")
         r = self.run_install("--user")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("downgrade 9.9.9 to 0.1.1", r.stderr)
+        self.assertIn("downgrade 9.9.9 to " + version(), r.stderr)
         self.assertEqual(self.run_install("--user", "--force").returncode, 0)
 
     def test_project_install(self):
@@ -150,6 +179,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isfile(os.path.join(proj, ".codex/codex-workforce/cwf/bin/cwf-hook")))
         self.assertTrue(os.path.isfile(os.path.join(proj, ".agents/skills/cwf-blueprint/SKILL.md")))
+        self.assertTrue(os.path.isfile(os.path.join(proj, ".codex", "agents", "content-classifier.toml")))
         handlers = self.cwf_handlers(self.hooks(os.path.join(proj, ".codex")))
         self.assertEqual(len(handlers), 4)
         self.assertIn("$(git rev-parse --show-toplevel)", handlers[0]["command"])

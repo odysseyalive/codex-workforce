@@ -21,8 +21,12 @@ PATHS=(
   workforce/bin/wf-widen
   workforce/bin/wf-turn-budget
   workforce/bin/wf-settings-apply
+  workforce/bin/wf-code-eval
+  workforce/bin/wf-map
+  workforce/bin/wf-census
   workforce/references/senses.md
-  workforce/skills/blueprint
+  workforce/agents
+  workforce/skills
 )
 
 sha="$(git -C "$CW_REPO" rev-parse "$COMMIT^{commit}")"

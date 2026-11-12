@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""wf-map — where to go in the code, GENERATED ON EVERY CALL AND NEVER STORED.
+
+THE DEFECT, MEASURED. Four coder orders were profiled from their transcripts on
+2026-10-12: **30-43% of their tool calls ran tests, 21-42% searched and read code, and
+only 14-21% edited anything.** Two of them ran out of turns. The user, the same day:
+*"if the bin check is taking a long time and the coder is running out of turns trying to
+find data, it seems to me that both of these would be helped by some kind of an index
+system to help direct where in the code to go for specific things."*
+
+So this answers three questions an employee otherwise answers with a dozen reads:
+
+    where in this file          `wf-map <file>`    sections and defs, with line numbers
+    which files mention this    `wf-map --topic …`  ranked, bounded, pasteable
+    what covers this file       `wf-map --tests …`  the checks, fixtures and prove cases
+
+NOTHING IS STORED, AND THAT IS THE DESIGN RATHER THAN AN OMISSION. A hand-kept index
+goes stale silently: the `lab` CLAUDE.md carried a roster of ~30 subprojects in which
+**12 no longer existed on disk and 10 that did exist were missing**, and nothing
+reported it for months. A map regenerated from the files cannot drift from them, and a
+map on disk is one more shipped file to keep true. The cost of regenerating is one pass
+over the text — MEASURED on this repository's own `bin/check` at 19,841 lines:
+0.08 s. Under the one-second budget by an order of magnitude, so there is no cache to
+justify.
+
+IT NAMES THE SELECTORS THAT ALREADY EXIST AND NEVER KEEPS A SECOND LIST, and it does
+not RUN them. `--tests` prints `bin/script-conformance --list --touching <file>` for the caller to run
+deliberately, beside what a text read can be sure of on its own. That suite decides
+coverage for its own runs, so no copy of their answer is kept here — a second list of
+"what covers what" is the stale index this script exists to avoid, one directory over.
+
+WHAT IT REFUSES TO DO, because it reads whatever path it is handed:
+
+  * **It never leaves the root.** Every target is resolved with `realpath` and must
+    still be inside the resolved root, so a symlink pointing out of the tree is
+    REFUSED by name rather than followed. The containment test happens before the open.
+  * **It never executes ANYTHING it finds in the tree** — not the file it maps, and not
+    a suite that happens to live there. Outlines come from reading text and matching
+    regexes, never from `import` and never from a loader; coverage commands are
+    PRINTED. The first version ran `bin/prove` out of the mapped root, gated on a
+    docstring match, and a docstring is text anybody can copy: in a hostile checkout
+    that gate would have run the checkout's code. There is no identity check an
+    installed copy can make that tells a stranger's `bin/prove` from this project's, so
+    the capability is gone rather than guarded.
+  * **Every `git` call is hardened against repository-local configuration**, which can
+    name an executable: `core.fsmonitor` and `core.hooksPath` are overridden on the
+    command line, `GIT_OPTIONAL_LOCKS=0` keeps a read from writing, and both calls are
+    argument lists with timeouts. A `git grep` in a repository somebody else wrote must
+    not be a way to start their program.
+  * **It caps what it reads** at CAP bytes per file, and says so when it truncates. A
+    multi-gigabyte generated file must not become this process's memory footprint.
+  * **No `shell=True`, ever.** The two tools it calls are invoked as argument lists,
+    with a timeout, and only after their own first bytes identify them as this
+    project's own (`SIGILS` below). A stranger's `bin/prove` is not run; that project
+    takes the handbook path instead.
+
+TWO BOUNDED DECISIONS, DECLARED SO NEITHER IS RE-LITIGATED:
+
+    sec-eval: the containment test resolves the path and the open follows it, so a link
+    swapped between the two would resolve differently. Bounded — this runs as the
+    developer, inside a tree that developer already has, with no privilege boundary to
+    cross, and an attacker who can swap a path in your checkout does not need this
+    script. Upgrade to opening each component with O_NOFOLLOW if it ever runs as
+    another user.
+
+    sec-eval: a repo-relative path beginning with `-` is printed inside a suggested
+    command rather than passed anywhere, so the caller reads it before any shell does.
+    Upgrade to a `--` separator in the printed form if a path like that ever appears.
+
+Exit codes
+    0  mapped
+    2  nothing could be read, or the target is outside the root
+
+Usage
+    wf-map <file> [<file>…]           outline: sections, defs, first doc line
+    wf-map --topic <words…>           files and lines that match, ranked
+    wf-map --tests <file>             what covers that file
+    options  --root DIR  --limit N
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+CAP = 4 * 1024 * 1024          # bytes read per file; see § WHAT IT REFUSES TO DO
+TOPIC_FILES = 12               # files reported per topic query
+TOPIC_LINES = 3                # example lines per file
+WIDTH = 108                    # a printed line is truncated to this, so output pastes
+DEFAULT_LIMIT = 200            # outline rows before the deepest are dropped
+TOOL_TIMEOUT = 120
+WALK_BUDGET = 20000            # files the no-git fallback reads before it says it stopped
+
+# EVERY VCS CALL IS HARDENED, because repository-local configuration can name an
+# EXECUTABLE and this script runs in trees it did not write. `core.fsmonitor` and
+# `core.hooksPath` are the two that start a program; both are overridden on the command
+# line, where no in-repo config can win. `GIT_OPTIONAL_LOCKS=0` keeps a read-only query
+# from writing to the index, and `GIT_TERMINAL_PROMPT=0` keeps it from ever asking for a
+# credential. Same class the commitments hook is fixing (O7).
+GIT = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+
+
+def git_env():
+    """The environment every vcs call gets: no optional writes, no prompts."""
+    return dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+             "corpus", ".mypy_cache", ".pytest_cache", ".next", "target", "vendor"}
+
+# A section banner on its own line: `# ── TITLE ──`, `## TITLE ##`, `/* == TITLE == */`.
+BANNER_INLINE = re.compile(r"^\s*(?:#|//|--|;|/\*)+\s*[─━—=*#~_+-]{2,}\s*(\S.*?)\s*[─━—=*#~_+-]{2,}")
+# A rule line whose TITLE is the comment line after it — `bin/check`'s own house style.
+BANNER_RULE = re.compile(r"^\s*(?:#|//|--|;|/\*)+\s*[─━—=*#~_+-]{8,}\s*(?:\*/)?\s*$")
+COMMENT_TEXT = re.compile(r"^\s*(?:#|//|--|;)+\s*(\S.*)$")
+
+PY_DEF = re.compile(r"^(\s*)(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)\s*(.*)$")
+SH_DEF = re.compile(r"^(\s*)(?:function\s+)?([A-Za-z_][\w:.-]*)\s*\(\)\s*\{?")
+MD_HEAD = re.compile(r"^(#{1,6})\s+(\S.*?)\s*#*$")
+GENERIC_DEF = re.compile(
+    r"^(\s*)(?:export\s+|public\s+|private\s+|protected\s+|static\s+|final\s+|async\s+)*"
+    r"(def|class|function|func|fn|sub|type|interface|struct|impl|module|trait|package)\s+"
+    r"([A-Za-z_$][\w$:.-]*)")
+DOCSTRING = re.compile(r'^\s*(?:[rubf]{0,2})("""|\'\'\')\s*(.*?)\s*(?:"""|\'\'\')?\s*$')
+
+# THE SUITES `--tests` NAMES, and it names them as COMMANDS FOR THE CALLER TO RUN. It
+# does not run them. The first version did, gated on a docstring match that was supposed
+# to prove the script was this project's own — and a docstring is text anybody can copy,
+# so `wf-map --tests` inside a hostile checkout would have run that checkout's code
+# (found in security review of fabecb3, before this reached anyone). No identity check
+# available to an installed copy can tell a stranger's `bin/prove` from ours, so the
+# class is removed rather than guarded: nothing in the mapped tree is ever executed.
+COVERAGE_COMMANDS = (
+    ("bin/script-conformance", "bin/script-conformance --list --touching {rel}",
+     "the conformance fixtures a change to this file can reach"),
+)
+EXPECTATIONS = "fixtures/scripts/expectations.json"
+
+
+def clip(text, width=WIDTH):
+    """One line, no tabs, bounded — every row printed goes through here."""
+    one = " ".join(str(text).split())
+    return one if len(one) <= width else one[: width - 1] + "…"
+
+
+def inside(root, path):
+    """The resolved path, or None when it escapes `root`.
+
+    `realpath` resolves every link in the chain, so this is the one test that catches a
+    symlink out of the tree. It is applied BEFORE any open, because following the link
+    to find out where it goes is the thing being prevented.
+    """
+    rroot = os.path.realpath(root)
+    real = os.path.realpath(path)
+    if real == rroot or real.startswith(rroot + os.sep):
+        return real
+    return None
+
+
+def read_capped(path):
+    """`(text, truncated)` — or `(None, False)` when it cannot be read as text."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(CAP + 1)
+    except OSError:
+        return None, False
+    truncated = len(raw) > CAP
+    raw = raw[:CAP]
+    if b"\0" in raw[:8192]:
+        return None, False          # binary: there is no outline to take
+    return raw.decode("utf-8", errors="replace"), truncated
+
+
+def language(path, text):
+    """`python` | `shell` | `markdown` | `generic`, from the name then the shebang."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".py", ".pyi"):
+        return "python"
+    if ext in (".sh", ".bash", ".zsh", ".ksh"):
+        return "shell"
+    if ext in (".md", ".markdown", ".mdx"):
+        return "markdown"
+    head = text[:200]
+    if head.startswith("#!"):
+        first = head.splitlines()[0]
+        if "python" in first:
+            return "python"
+        if any(s in first for s in ("sh", "bash", "zsh", "ksh")):
+            return "shell"
+    return "generic"
+
+
+def first_doc(lines, i, lang):
+    """The first docstring or comment line belonging to the definition on line `i`.
+
+    Looks DOWN for a docstring (python) and UP for a comment block (every language),
+    because those are where the one sentence that says what a thing is actually lives.
+    """
+    if lang == "python":
+        for j in range(i + 1, min(i + 4, len(lines))):
+            line = lines[j]
+            if not line.strip():
+                continue
+            m = DOCSTRING.match(line)
+            if m:
+                if m.group(2):
+                    return m.group(2)
+                nxt = lines[j + 1] if j + 1 < len(lines) else ""
+                return nxt.strip()
+            break
+    for j in range(i - 1, max(i - 4, -1), -1):
+        line = lines[j]
+        if not line.strip():
+            break
+        m = COMMENT_TEXT.match(line)
+        if m and not BANNER_RULE.match(line):
+            return m.group(1)
+        break
+    return ""
+
+
+def banner(lines, i):
+    """The section title declared at line `i`, or ""."""
+    m = BANNER_INLINE.match(lines[i])
+    if m and len(re.findall(r"\w", m.group(1))) >= 3:
+        return m.group(1)
+    if BANNER_RULE.match(lines[i]):
+        for j in range(i + 1, min(i + 3, len(lines))):
+            m2 = COMMENT_TEXT.match(lines[j])
+            if m2 and not BANNER_RULE.match(lines[j]) and len(re.findall(r"\w", m2.group(1))) >= 3:
+                return m2.group(1)
+            if not lines[j].strip():
+                break
+    return ""
+
+
+def outline(path, text, lang):
+    """Rows of `(lineno, depth, kind, label, note)`, in file order.
+
+    ONE PASS, and the regexes are the only work per line. That is what keeps a
+    19,841-line file under a tenth of a second — an AST parse would be more precise on
+    python and would refuse every file that does not currently parse, which is exactly
+    the file somebody is mapping while they fix it.
+    """
+    lines = text.splitlines()
+    rows = []
+    for i, line in enumerate(lines):
+        n = i + 1
+        if lang == "markdown":
+            m = MD_HEAD.match(line)
+            if m:
+                note = ""
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    s = lines[j].strip()
+                    # An HTML comment under a heading is an enforcement marker in this
+                    # project's own references, never the sentence that says what the
+                    # section is for.
+                    if s and not s.startswith("<!--") and not MD_HEAD.match(lines[j]):
+                        note = s
+                        break
+                rows.append((n, len(m.group(1)) - 1, "§", m.group(2), note))
+            continue
+        title = banner(lines, i)
+        if title:
+            rows.append((n, 0, "§", title, ""))
+            continue
+        m = PY_DEF.match(line) if lang == "python" else None
+        if m:
+            depth = len(m.group(1).expandtabs(4)) // 4
+            rows.append((n, depth, m.group(2), m.group(3), first_doc(lines, i, lang)))
+            continue
+        if lang == "shell":
+            m = SH_DEF.match(line)
+            if m and m.group(2) not in ("if", "then", "else", "fi", "case", "esac", "while"):
+                rows.append((n, 0, "fn", m.group(2), first_doc(lines, i, lang)))
+            continue
+        if lang == "generic":
+            m = GENERIC_DEF.match(line)
+            if m:
+                depth = len(m.group(1).expandtabs(4)) // 4
+                rows.append((n, depth, m.group(2), m.group(3), first_doc(lines, i, lang)))
+                continue
+            m = MD_HEAD.match(line)
+            if m:
+                rows.append((n, len(m.group(1)) - 1, "§", m.group(2), ""))
+    return rows
+
+
+def print_outline(rel, text, truncated, lang, limit):
+    rows = outline(rel, text, lang)
+    # OVER THE LIMIT, THE DEEPEST ROWS GO LAST. Truncating in file order would hand back
+    # the top of a 19k-line file and call it a map of the file, so the budget is spent a
+    # depth at a time: every section first, then every top-level def, then the nested
+    # ones until it runs out. The limit is always FILLED — an early version dropped a
+    # whole layer to stay under it and printed nothing at all for `bin/check`.
+    kept = []
+    for d in sorted({r[1] for r in rows}):
+        layer = [r for r in rows if r[1] == d]
+        if len(kept) + len(layer) <= limit:
+            kept += layer
+        else:
+            kept += layer[: max(0, limit - len(kept))]
+            break
+    kept.sort(key=lambda r: r[0])
+    dropped = len(rows) - len(kept)
+    secs = sum(1 for r in rows if r[2] == "§")
+    print(f"{rel}  ·  {lang} · {len(text.splitlines())} lines · "
+          f"{len(rows) - secs} def(s) · {secs} section(s)"
+          + ("  · TRUNCATED at %d bytes" % CAP if truncated else ""))
+    for n, depth, kind, label, note in kept:
+        # THE LINE NUMBER IS PRINTED OUTSIDE `clip`, which collapses runs of whitespace
+        # and so eats both the column and the nesting indent when it is handed the
+        # whole row. The number is the one column a reader scans.
+        body = "  " * min(depth, 4) + f"{kind} {label}" + (f"    {note}" if note else "")
+        print(f"{n:>6}  {clip(body, WIDTH - 8)}")
+    if dropped:
+        print(f"       … {dropped} deeper row(s) not shown — raise with --limit")
+    print()
+
+
+def git_root(root):
+    """`root` when it is inside a git work tree and git is usable, else None."""
+    try:
+        # PYTHON 3.6 IS THE FLOOR — RHEL 8 ships it (DEF-Q-001) — so never
+        # `capture_output=` or `text=`: both arrived in 3.7 and a 3.7 call crashes there.
+        r = subprocess.run(GIT + ["-C", root, "rev-parse", "--is-inside-work-tree"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=30, env=git_env())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return root if r.returncode == 0 and r.stdout.strip() == "true" else None
+
+
+def topic_git(root, words):
+    """Per-word hits from `git grep`, which honours .gitignore for free.
+
+    One invocation per word rather than one alternation, because the RANK needs to know
+    how many of the words a file matched — a file carrying every word is the one worth
+    opening first, and a single regex cannot report that.
+    """
+    hits = {}
+    for w in words:
+        try:
+            r = subprocess.run(
+                GIT + ["-C", root, "grep", "-n", "-I", "-i", "--untracked",
+                       "--no-color", "-F", "-e", w],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=TOOL_TIMEOUT, env=git_env())
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode not in (0, 1):
+            return None
+        for line in r.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[1].isdigit():
+                hits.setdefault(parts[0], {"words": set(), "lines": {}})
+                hits[parts[0]]["words"].add(w.lower())
+                hits[parts[0]]["lines"][int(parts[1])] = parts[2]
+    return hits
+
+
+def topic_walk(root, words):
+    """The no-git fallback: one bounded walk, text files only.
+
+    TWO BOUNDS AND A SKIP, each because the git path gets the same protection for free
+    and this one does not:
+
+      * **dotfiles and dot-directories are skipped.** `git grep --untracked` never
+        reports an ignored file, so a topic query in a repository cannot surface `.env`,
+        a cached credential or a vendored tree. Without this, the SAME query in a
+        directory that is not a repository would print those lines into an agent's
+        context — the output of this tool is read by a model, which is a disclosure
+        surface rather than a terminal somebody glances at.
+      * **a file budget.** A walk over a home directory or a mounted volume would read
+        for minutes; `git grep` is bounded by its own timeout. The budget is reported
+        when it bites, because a truncated search that looks complete is worse than a
+        slow one.
+    """
+    hits = {}
+    low = [w.lower() for w in words]
+    seen = 0
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith("."))
+        for f in sorted(files):
+            if f.startswith("."):
+                continue
+            seen += 1
+            if seen > WALK_BUDGET:
+                print(f"… stopped after {WALK_BUDGET} files — narrow with --root, or "
+                      f"run this inside a repository where git bounds the search")
+                return hits
+            p = os.path.join(d, f)
+            if os.path.islink(p) or not inside(root, p):
+                continue
+            text, _ = read_capped(p)
+            if text is None:
+                continue
+            rel = os.path.relpath(p, root)
+            for i, line in enumerate(text.splitlines(), 1):
+                ll = line.lower()
+                for w in low:
+                    if w in ll:
+                        hits.setdefault(rel, {"words": set(), "lines": {}})
+                        hits[rel]["words"].add(w)
+                        hits[rel]["lines"][i] = line
+    return hits
+
+
+# A MATCHING LINE IS ONE HIT, however many of the query's words it carries, so the hits
+# are keyed by line number. The first version appended one entry per word and printed the
+# same line three times, which reads as three places to look.
+def print_topic(root, words, limit):
+    source = "git grep"
+    hits = topic_git(root, words) if git_root(root) else None
+    if hits is None:
+        hits, source = topic_walk(root, words), "walk"
+    ranked = sorted(hits.items(),
+                    key=lambda kv: (-len(kv[1]["words"]), -len(kv[1]["lines"]), kv[0]))
+    shown = ranked[: max(1, min(limit, TOPIC_FILES))]
+    print(f"topic: {' '.join(words)}  ·  {len(ranked)} file(s) matched "
+          f"({source}, {len(words)} word(s))")
+    if not ranked:
+        print("  nothing matched — try fewer or broader words\n")
+        return 0
+    for rel, info in shown:
+        print(f"\n{rel}  ·  {len(info['lines'])} hit(s) · "
+              f"{len(info['words'])}/{len(words)} word(s)")
+        for n, line in sorted(info["lines"].items())[:TOPIC_LINES]:
+            print(f"{n:>6}  {clip(line, WIDTH - 8)}")
+    if len(ranked) > len(shown):
+        print(f"\n… {len(ranked) - len(shown)} more file(s) — narrow the words")
+    print()
+
+
+def have(root, rel):
+    """True when `rel` is a regular file inside `root` — read as a FACT, never run."""
+    p = os.path.join(root, rel)
+    return not os.path.islink(p) and os.path.isfile(p) and bool(inside(root, p))
+
+
+def fixture_cases(root, rel):
+    """Conformance cases naming `rel`, read STATICALLY out of `expectations.json`.
+
+    JSON IS DATA; A SCRIPT IS NOT. `bin/script-conformance --list --touching` computes
+    this more precisely — it follows one script loading another — but computing it means
+    running a program out of the mapped tree, which is the thing this script does not
+    do. So the rows here are the ones a text read can be sure of (a case whose `script`
+    is this file, or whose own fixture directory is this path), and the command that
+    computes the full set is PRINTED for the caller to run deliberately.
+    """
+    p = os.path.join(root, EXPECTATIONS)
+    if not have(root, EXPECTATIONS):
+        return []
+    text, _ = read_capped(p)
+    if not text:
+        return []
+    try:
+        rows = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(rows, dict):
+        return []
+    base = os.path.basename(rel)
+    out = []
+    for name, spec in sorted(rows.items()):
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("script") == base or rel.startswith(f"fixtures/scripts/{name}/"):
+            out.append(name)
+    return out
+
+
+def handbook_checks(root, rel):
+    """Every handbook `Check:`/`Regression:`/`Negative:` line naming `rel` or its directory.
+
+    THE PROJECT PATH, and it is the common one — a staffed project has no `bin/prove`.
+    `handbook-templates.md` § Verification is the shape these lines come in, so the
+    employees' own runnable proofs ARE the test map wherever this script has no suite to
+    ask.
+    """
+    rx = re.compile(r"^\s*[-*]?\s*\**(Check|Regression|Negative)\**:\s*(\S.*)$")
+    base = os.path.basename(rel)
+    folder = os.path.dirname(rel)
+    out = []
+    agents = os.path.join(root, ".codex", "agents")
+    for d, dirs, files in os.walk(agents):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
+        for f in sorted(files):
+            if not f.endswith(".md"):
+                continue
+            p = os.path.join(d, f)
+            if os.path.islink(p) or not inside(root, p):
+                continue
+            text, _ = read_capped(p)
+            if not text:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                m = rx.match(line)
+                if not m:
+                    continue
+                if rel in line or base in line or (folder and folder in line):
+                    out.append((os.path.relpath(p, root), i, m.group(1), m.group(2)))
+    return out
+
+
+def print_tests(root, rel, target):
+    """What covers `rel`: the commands that answer it, the fixtures a text read is sure
+    of, and the handbook checks that name it. NOTHING HERE IS EXECUTED."""
+    print(f"tests covering {rel}\n")
+    cmds = [(c.format(rel=rel), why) for tool, c, why in COVERAGE_COMMANDS
+            if have(root, tool)]
+    if cmds:
+        print(f"  suites in this tree · {len(cmds)} command(s) — RUN THESE YOURSELF; "
+              f"wf-map never executes a script it found in the tree")
+        for c, why in cmds:
+            print("    $ " + clip(f"{c}    # {why}", WIDTH - 8))
+    cases = fixture_cases(root, rel)
+    if cases:
+        print(f"\n  conformance fixtures naming it · {len(cases)} "
+              f"(read from {EXPECTATIONS}; the --touching command above computes the "
+              f"transitive set)")
+        for c in cases[:20]:
+            print("    · " + clip(c, WIDTH - 8))
+        if len(cases) > 20:
+            print(f"    … {len(cases) - 20} more")
+    rows = handbook_checks(root, rel)
+    if rows or not cmds:
+        print(f"\n  handbook checks · {len(rows)}")
+        for hb, n, kind, cmd in rows[:20]:
+            print("    · " + clip(f"{hb}:{n}  {kind}: {cmd}", WIDTH - 8))
+        if len(rows) > 20:
+            print(f"    … {len(rows) - 20} more")
+        if not rows:
+            print("    no handbook names this file in a Check:, Regression: or Negative: line")
+    print()
+    if target is None:
+        print("note: the file is not on disk — reporting only what names it\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--topic", nargs="+", default=None)
+    ap.add_argument("--tests", default=None)
+    ap.add_argument("--root", default=None)
+    ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    ap.add_argument("--help", "-h", action="store_true")
+    args = ap.parse_args()
+    if args.help or not (args.paths or args.topic or args.tests):
+        print(__doc__[__doc__.index("Usage"):].rstrip())
+        return 0 if args.help else 2
+
+    root = os.path.abspath(args.root or os.environ.get("CWF_PROJECT_DIR") or os.getcwd())
+    if not os.path.isdir(root):
+        print(f"wf-map: root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    if args.topic:
+        print_topic(root, args.topic, args.limit)
+        return 0
+
+    if args.tests:
+        rel = os.path.relpath(os.path.abspath(os.path.join(root, args.tests)), root)
+        target = inside(root, os.path.join(root, args.tests))
+        if rel.startswith(".."):
+            print(f"wf-map: {args.tests} is outside the root {root}", file=sys.stderr)
+            return 2
+        if target is None:
+            # A path whose LINKS leave the tree is refused; a path that is simply
+            # absent is not — "what covers a file I am about to write" is a fair
+            # question, and nothing is read to answer it.
+            if os.path.lexists(os.path.join(root, args.tests)):
+                print(f"wf-map: {args.tests} resolves outside the root {root} — refusing",
+                      file=sys.stderr)
+                return 2
+        print_tests(root, rel, target)
+        return 0
+
+    mapped = 0
+    for p in args.paths:
+        rel = os.path.relpath(os.path.abspath(os.path.join(root, p)), root)
+        real = inside(root, os.path.join(root, p))
+        if real is None or rel.startswith(".."):
+            print(f"wf-map: {p} resolves outside the root {root} — refusing", file=sys.stderr)
+            continue
+        if os.path.isdir(real):
+            print(f"wf-map: {rel} is a directory — map a file, or use --topic", file=sys.stderr)
+            continue
+        text, truncated = read_capped(real)
+        if text is None:
+            print(f"wf-map: {rel} is not readable as text", file=sys.stderr)
+            continue
+        print_outline(rel, text, truncated, language(rel, text), args.limit)
+        mapped += 1
+    # NOTHING MAPPED EXITS NONZERO. An empty map and a map of an empty file read the
+    # same on stdout, and the caller is usually a script.
+    return 0 if mapped else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

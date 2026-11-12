@@ -154,6 +154,17 @@ if ($DoUninstall) {
             }
         }
     }
+    $agentList = Join-Path $InstallDir "installed-agents.txt"
+    if (Test-Path $agentList) {
+        $agentsFull = [IO.Path]::GetFullPath((Join-Path $ConfDir "agents"))
+        foreach ($name in Get-Content $agentList) {
+            if ($name -notmatch '^[A-Za-z0-9._-]+\.toml$' -or $name.Contains("..")) { continue }
+            $target = [IO.Path]::GetFullPath((Join-Path $agentsFull $name))
+            if ([IO.Path]::GetDirectoryName($target) -eq $agentsFull) {
+                Remove-Item -Force -ErrorAction SilentlyContinue $target
+            }
+        }
+    }
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
     if (Test-Path $HooksJson) { Edit-Hooks "remove" }
     Say "removed from $Scope scope ($InstallDir). Other hooks in $HooksJson were kept."
@@ -193,6 +204,14 @@ try {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
     Move-Item $New $InstallDir
 
+    # The installer directory is a whole replacement, so agents arrive inside it. Capture
+    # their names from this staged copy before pruning or moving anything.
+    $srcAgents = Join-Path $files "cwf\agents"
+    $installedAgents = @()
+    if (Test-Path $srcAgents) {
+        $installedAgents = @(Get-ChildItem -File $srcAgents -Filter "*.toml" | ForEach-Object { $_.Name })
+    }
+
     $installed = @()
     $srcSkills = Join-Path $files ".agents\skills"
     if (Test-Path $srcSkills) {
@@ -204,6 +223,16 @@ try {
         }
     }
     Set-Content -Encoding utf8 (Join-Path $InstallDir "installed-skills.txt") $installed
+    # Custom agents are not skills: Codex discovers them only in .codex/agents/.
+    if (Test-Path $srcAgents) {
+        $agentDir = Join-Path $ConfDir "agents"
+        New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
+        Get-ChildItem -File $srcAgents -Filter "*.toml" | ForEach-Object {
+            Copy-Item -Force $_.FullName (Join-Path $agentDir $_.Name)
+            $installedAgents += $_.Name
+        }
+    }
+    Set-Content -Encoding utf8 (Join-Path $InstallDir "installed-agents.txt") $installedAgents
 
     Edit-Hooks "add"
 } finally {
