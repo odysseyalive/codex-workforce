@@ -256,8 +256,9 @@ class SenseTests(unittest.TestCase):
 
     # ── .gitignore ──────────────────────────────────────────────────────────
 
-    INFRA = [".claude/workforce/x.json", "CLAUDE.md", ".crush/crush.db", ".opencode/x",
-             ".playwright-mcp/page.yml", ".codex-workforce/issues/s.json",
+    INFRA = [".claude/workforce/x.json", "CLAUDE.md", ".crush/crush.db", ".crushrc",
+             "crushrc", ".opencode/x", ".playwright-mcp/page.yml",
+             ".codex-workforce/issues/s.json",
              "tests/__pycache__/x.pyc", ".env"]
     PACKAGE = ["AGENTS.md", ".agents/skills/cwf-blueprint/SKILL.md", ".codex/hooks.json",
                "cwf/bin/cwf-hook", "cwf/lib/cwf_codex.py", "scripts/sync-upstream",

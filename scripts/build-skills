@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the Codex/Crush skill copies in .agents/skills/ from upstream/claude-workforce.
+"""Generate the Codex skill copies in .agents/skills/ from upstream/claude-workforce.
 
-Each skill gets the cwf- prefix (Crush requires `name` to equal the folder name, and the
-prefix keeps it apart from claude-workforce's copies), Claude-only frontmatter keys are
-dropped, and listed text replacements are applied. A replacement whose source text is no
-longer in upstream fails the build, so a re-sync can't silently leave Claude terms behind.
+Each skill gets the cwf- prefix so it stays apart from claude-workforce's copies. Claude-only
+frontmatter keys are dropped, and listed text replacements are applied. A replacement whose
+source text is no longer in upstream fails the build, so a re-sync can't silently leave Claude
+terms behind.
 
 Usage: scripts/build-skills        (run after scripts/sync-upstream)
 """

@@ -1,7 +1,9 @@
 # codex-workforce
 
 A workforce system for OpenAI Codex CLI, ported from claude-workforce
-(github.com/odysseyalive/claude-workforce). Crush is a secondary, skills-only target.
+(github.com/odysseyalive/claude-workforce). Codex is the only supported host. Crush
+compatibility was cut on 2026-11-11; the Crush probing remains historical discovery evidence,
+not a product target.
 
 ## Current state: bare-metal senses
 
@@ -70,9 +72,10 @@ stay a git repository.
 - Versioning: `VERSION` holds the release (`0.1.0`). Any change to a file in `manifest.txt`
   bumps it and adds a `CHANGELOG.md` entry. Every new runtime file goes in `manifest.txt`;
   `tests/test_install.py` fails if one is missing.
-  Files left by the tools used to build it (Claude Code, Crush, opencode, playwright-mcp,
-  agent-say) belong in `.gitignore`. When a new tool or folder shows up, add it there and to
-  `INFRA` in `tests/test_senses.py`; a new package folder goes in the test's `allowed` set.
+  Files left by the tools used to build it (Claude Code, Crush discovery probes, opencode,
+  playwright-mcp, agent-say) belong in `.gitignore`. When a new tool or folder shows up, add
+  it there and to `INFRA` in `tests/test_senses.py`; a new package folder goes in the
+  test's `allowed` set.
 
 ## Settings
 

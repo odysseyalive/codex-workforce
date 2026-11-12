@@ -13,10 +13,12 @@
 .claude/
 CLAUDE.md
 CLAUDE.local.md
-# Crush (session database and logs)
+# Crush discovery probes only; Crush is not a supported host (session database, logs, config)
 .crush/
 CRUSH.md
 CRUSH.local.md
+.crushrc
+crushrc
 # opencode
 .opencode/
 # playwright-mcp browser snapshots and screenshots
