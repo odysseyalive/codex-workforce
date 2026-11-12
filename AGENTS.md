@@ -8,9 +8,9 @@ not a product target.
 ## Current state: bare-metal senses
 
 The claude-workforce sensory layer is wired into Codex sessions in this repository through
-`.codex/hooks.json`. It is verified by `tests/` and by replaying real Codex rollouts through
-the hooks; the hooks have **not yet been seen firing inside a live Codex session**, because
-that needs the trust step below.
+`.codex/hooks.json`. It is verified by `tests/`, by replaying real Codex rollouts, and by live
+Codex sessions in this repository on 2026-11-11. The hooks require the trust step below, and
+the prompt, SubagentStart, Stop and SubagentStop payloads have all been observed live.
 
 | Codex event | Runs | Does |
 |---|---|---|
@@ -43,8 +43,8 @@ file when the handoff is finished; nothing executes its contents.
 
 - Whether Codex fires UserPromptSubmit for a Stop continuation (handled either way: the
   feedback prefix keeps it from being tagged as an ask).
-- What Codex's SubagentStop payload carries, especially `agent_transcript_path`.
-- Whether hook commands run inside Codex's sandbox.
+- None for the four shipped events; live payloads were measured on 2026-11-11.
+  The `--ephemeral` transcript-null case remains an adapter gap (F03 in `audit/FINDINGS.md`).
 
 ## Layout
 
