@@ -7,8 +7,9 @@ it is not injected into subagents or Stop-feedback continuations.
 ## Where the project stands
 
 - Repo: `/home/francis/lab/codex-workforce`
-- HEAD: `2f7c55f` — "Record that the Codex hooks have fired live". The resume mechanism is
-  `d3238f9`, the Crush cut is `cfa640b`, and this file was last corrected at `2f7c55f`.
+- HEAD: run `git log -1 --oneline`; this file deliberately does not repeat its own commit hash.
+  The resume mechanism arrived in `d3238f9`, the Crush cut is `cfa640b`, and the live-hook
+  status is recorded at `2f7c55f`.
 - VERSION: `0.1.1`
 - Tests: `python3 -m unittest discover -s tests -v` — 33 tests, OK.
 - Live hook status: prompt, SubagentStart, Stop and SubagentStop have all fired in this
