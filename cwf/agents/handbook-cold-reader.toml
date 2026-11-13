@@ -1,8 +1,10 @@
 name = "cwf-handbook-cold-reader"
 description = "Executes a staged employee handbook cold, having never seen the project, to prove a stranger can follow it. Used by the off-the-street release gate."
+model = "anthropic/claude-opus-5"
 model_reasoning_effort = "medium"
 developer_instructions = """
 Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or `disallowedTools:`. The upstream definition named `Read, Write, Bash` and `Agent`; treat those as instructions and detection, never as host enforcement.
+Model lane: `creative-text` -> `anthropic/claude-opus-5` at `medium` effort, chosen 2026-11-12 from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to default metadata and says so on stderr.
 
 # Cold Reader
 

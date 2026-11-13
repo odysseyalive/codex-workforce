@@ -249,17 +249,19 @@ class SenseTests(unittest.TestCase):
 
     # ── generated skills and custom agents ───────────────────────────────────
 
-    def test_generated_skills_are_eight_and_speak_codex(self):
-        """Generation is a product surface: all eight upstream skills, `$cwf-` invocation,
+    def test_generated_skills_are_nine_and_speak_codex(self):
+        """Generation is a product surface: the eight upstream skills plus the port's own
+        `cwf-dev` maintainer skill, `$cwf-` invocation,
         no Claude command namespace or `.claude/` state path, and valid YAML metadata."""
         import yaml
-        base = os.path.join(ROOT, ".agents", "skills")
+        base = os.path.join(ROOT, "cwf", "skills")
         skills = sorted(d for d in os.listdir(base)
                         if d.startswith("cwf-") and os.path.isfile(
                             os.path.join(base, d, "SKILL.md")))
-        self.assertEqual(skills, ["cwf-blueprint", "cwf-code-evaluator", "cwf-records-code-map",
-                                  "cwf-security-evaluator", "cwf-shared-artifact", "cwf-text-eval",
-                                  "cwf-timezone", "cwf-ui-design"])
+        self.assertEqual(skills, ["cwf-blueprint", "cwf-code-evaluator", "cwf-dev",
+                                  "cwf-records-code-map", "cwf-security-evaluator",
+                                  "cwf-shared-artifact", "cwf-text-eval", "cwf-timezone",
+                                  "cwf-ui-design"])
         for name in skills:
             p = os.path.join(base, name, "SKILL.md")
             with open(p, encoding="utf-8") as fh:
@@ -292,7 +294,7 @@ class SenseTests(unittest.TestCase):
         # not the upstream repository layout they were copied from.
         for skill, needle in (("cwf-code-evaluator", "$WF/cwf/bin/wf-code-eval"),
                               ("cwf-records-code-map", "$WF/cwf/bin/wf-map")):
-            with open(os.path.join(ROOT, ".agents", "skills", skill, "SKILL.md"),
+            with open(os.path.join(ROOT, "cwf", "skills", skill, "SKILL.md"),
                       encoding="utf-8") as fh:
                 self.assertIn(needle, fh.read())
         for name, forbidden in (
@@ -310,7 +312,7 @@ class SenseTests(unittest.TestCase):
         with open(os.path.join(ROOT, "AGENTS.md"), encoding="utf-8") as fh:
             agents_md = fh.read()
         self.assertIn("eight upstream skills", agents_md)
-        self.assertIn("nine Codex custom agents", agents_md)
+        self.assertIn("ten Codex custom agents", agents_md)
         with open(os.path.join(ROOT, "VERSION")) as fh:
             self.assertIn("VERSION` holds the release (`" + fh.read().strip(), agents_md)
 
@@ -318,7 +320,7 @@ class SenseTests(unittest.TestCase):
         import tomllib
         base = os.path.join(ROOT, "cwf", "agents")
         files = sorted(f for f in os.listdir(base) if f.endswith(".toml"))
-        self.assertEqual(len(files), 9)
+        self.assertEqual(len(files), 10)
         for fn in files:
             with open(os.path.join(base, fn), "rb") as fh:
                 data = tomllib.load(fh)
@@ -537,9 +539,9 @@ class SenseTests(unittest.TestCase):
              "crushrc", ".opencode/x", ".playwright-mcp/page.yml",
              ".codex-workforce/issues/s.json",
              "tests/__pycache__/x.pyc", ".env"]
-    PACKAGE = ["AGENTS.md", "RESUME.md", ".agents/skills/cwf-blueprint/SKILL.md",
-               ".agents/skills/cwf-code-evaluator/SKILL.md",
-               ".agents/skills/cwf-text-eval/SKILL.md", ".codex/hooks.json",
+    PACKAGE = ["AGENTS.md", "RESUME.md", "cwf/skills/cwf-blueprint/SKILL.md",
+               "cwf/skills/cwf-code-evaluator/SKILL.md",
+               "cwf/skills/cwf-text-eval/SKILL.md", ".codex/hooks.json",
                "cwf/bin/cwf-hook", "cwf/lib/cwf_codex.py", "scripts/sync-upstream",
                "tests/test_senses.py", "upstream/claude-workforce/UPSTREAM.md", ".gitignore"]
 
@@ -558,7 +560,7 @@ class SenseTests(unittest.TestCase):
         r = subprocess.run(["git", "-C", ROOT, "ls-files", "--others", "--exclude-standard"],
                            capture_output=True, text=True)
         tops = {p.split("/", 1)[0] for p in r.stdout.split()}
-        allowed = {"AGENTS.md", "RESUME.md", ".agents", ".codex", "cwf", "scripts", "tests",
+        allowed = {"AGENTS.md", "RESUME.md", ".codex", "cwf", "scripts", "tests",
                    "upstream", ".gitignore", "README.md", "LICENSE", "install", "install.ps1",
                    "manifest.txt", "VERSION", "CHANGELOG.md"}
         self.assertEqual(tops - allowed, set(), "unexpected files would be committed")
@@ -574,6 +576,113 @@ class SenseTests(unittest.TestCase):
                 rel, digest = line[3:].split("` ")
                 with open(os.path.join(base, rel), "rb") as fh:
                     self.assertEqual(hashlib.sha256(fh.read()).hexdigest()[:16], digest.strip(), rel)
+
+
+class ModelLaneTests(unittest.TestCase):
+    """Every generated agent pins a model, and every pin is a model Codex can catalogue.
+
+    The pin is the feature: an agent that inherits the session model is not on its lane.
+    The catalog check exists because a model catalog entry with a bad field is a Codex-wide
+    startup error — one malformed `input_modalities` value broke every `codex exec` here on
+    2026-11-12, and a test that only parsed the TOMLs would have missed it.
+    """
+
+    def setUp(self):
+        self.agents = sorted(glob.glob(os.path.join(ROOT, "cwf", "agents", "*.toml")))
+        self.assertTrue(self.agents, "no generated agents found")
+
+    def test_every_agent_pins_a_model_and_an_effort(self):
+        import tomllib
+        for path in self.agents:
+            with open(path, "rb") as fh:
+                fields = tomllib.load(fh)
+            with self.subTest(agent=os.path.basename(path)):
+                self.assertTrue(fields.get("model"), "no model pin")
+                self.assertIn(fields.get("model_reasoning_effort"),
+                              ("low", "medium", "high"),
+                              "effort missing or outside the sanctioned rungs")
+                self.assertIn("Model lane:", fields["developer_instructions"])
+                for key in ("name", "description", "developer_instructions"):
+                    self.assertTrue(fields.get(key), key)
+
+    def test_every_pin_is_a_unique_lane_default(self):
+        import tomllib
+        pins = {}
+        for path in self.agents:
+            with open(path, "rb") as fh:
+                fields = tomllib.load(fh)
+            pins[os.path.basename(path)] = fields["model"]
+        lane_models = {"google/gemini-4-carbon", "meta/muse-wonder",
+                       "anthropic/claude-opus-5", "anthropic/claude-opus-5.5"}
+        for name, model in pins.items():
+            with self.subTest(agent=name):
+                self.assertIn(model, lane_models,
+                              "a pin outside the four lane defaults drifted in")
+
+    def test_an_installed_catalog_entry_is_well_formed(self):
+        """If a catalog exists, every modality must be one Codex accepts.
+
+        This is the regression for the field that broke Codex's startup: `file` is
+        carried by OpenRouter but is not a valid Codex input modality.
+        """
+        import json
+        catalog = os.path.join(os.path.expanduser("~"), ".codex",
+                               "openrouter-model-catalog.json")
+        if not os.path.isfile(catalog):
+            self.skipTest("no local model catalog on this machine")
+        with open(catalog) as fh:
+            models = json.load(fh)["models"]
+        allowed = {"text", "image", "audio"}
+        for model in models:
+            bad = set(model.get("input_modalities") or []) - allowed
+            with self.subTest(model=model.get("id")):
+                self.assertFalse(bad, f"invalid input modalities: {sorted(bad)}")
+
+
+class DispatchContextTests(unittest.TestCase):
+    """The prompt hook must tell a session that a job can go to a subagent.
+
+    Upstream added this line after measuring a project that did a whole job in the main thread
+    because nothing said otherwise (wf-task-tag, measured 2026-11-08). Codex has no tagger
+    hook, so this port injects it on every main-session prompt. It is advisory: nothing refuses.
+    """
+
+    def test_no_org_names_a_plain_subagent_and_the_code_lane(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = cwf_codex.dispatch_context(d)
+        self.assertIn("no workforce org", ctx)
+        self.assertIn("plain `general-purpose` subagent", ctx)
+        self.assertIn("cwf-implementer", ctx)
+        self.assertIn("close_agent", ctx)
+        self.assertIn("Work inline only when", ctx)
+
+    def test_a_marked_chart_selects_the_org_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".codex-workforce"))
+            with open(os.path.join(d, ".codex-workforce", "org-chart.md"), "w") as fh:
+                fh.write("# chart\n<!-- AUTO-GENERATED by an index run -->\n")
+            ctx = cwf_codex.dispatch_context(d)
+        self.assertIn("has a workforce org", ctx)
+        self.assertNotIn("no workforce org", ctx)
+        self.assertIn("background plain subagent", ctx)
+
+    def test_an_unmarked_chart_is_not_an_org(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".codex-workforce"))
+            with open(os.path.join(d, ".codex-workforce", "org-chart.md"), "w") as fh:
+                fh.write("# hand-written, no marker\n")
+            ctx = cwf_codex.dispatch_context(d)
+        self.assertIn("no workforce org", ctx)
+
+    def test_only_a_main_prompt_receives_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".codex-workforce"))
+            base = {"session_id": "s1", "cwd": d, "transcript_path": ""}
+            prompt, _ = cwf_codex.normalize_payload(
+                dict(base, hook_event_name="UserPromptSubmit", prompt="hi"))
+            stop, _ = cwf_codex.normalize_payload(dict(base, hook_event_name="Stop"))
+        self.assertIn("workforce org", prompt["cwf_dispatch_context"])
+        self.assertEqual(stop["cwf_dispatch_context"], "")
 
 
 if __name__ == "__main__":

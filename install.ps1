@@ -198,9 +198,11 @@ try {
     $New = "$InstallDir.cwf-new"
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $New
     New-Item -ItemType Directory -Force -Path $New, $SkillsDir | Out-Null
-    Get-ChildItem -Force $files | Where-Object { $_.Name -ne ".agents" } | ForEach-Object {
+    Get-ChildItem -Force $files | ForEach-Object {
         Copy-Item -Recurse -Force $_.FullName $New
     }
+    # cwf\skills is the visible SOURCE for <skills-root>\<name>\, not install-dir content.
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $New "cwf\skills")
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
     Move-Item $New $InstallDir
 
@@ -213,7 +215,7 @@ try {
     }
 
     $installed = @()
-    $srcSkills = Join-Path $files ".agents\skills"
+    $srcSkills = Join-Path $files "cwf\skills"
     if (Test-Path $srcSkills) {
         foreach ($skill in Get-ChildItem -Directory $srcSkills) {
             $dest = Join-Path $SkillsDir $skill.Name
@@ -239,8 +241,19 @@ try {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Stage
 }
 
+# Make the shipped OpenRouter models selectable. Writes a profile and a merged catalog
+# beside config.toml; never changes the default model or provider, and never writes a key.
+$catalogTool = Join-Path $InstallDir "cwf\bin\cwf-model-catalog"
+if (Test-Path $catalogTool) {
+    $args3 = if ($Py -eq "py") { @("-3", $catalogTool, "install", "--config", $ConfDir) } else { @($catalogTool, "install", "--config", $ConfDir) }
+    & $Py @args3
+    if ($LASTEXITCODE -ne 0) { Say "note: the model catalog step failed; run cwf-model-catalog install by hand" }
+}
+
 if ($Current -eq "unknown") { Say "installed $Incoming ($Scope scope) in $InstallDir" }
 elseif ($Current -eq $Incoming) { Say "reinstalled $Incoming ($Scope scope) in $InstallDir" }
 else { Say "updated $Current -> $Incoming ($Scope scope) in $InstallDir" }
 Say "hooks added to $HooksJson; skills in $SkillsDir"
+Say "models: select the shipped OpenRouter set with: codex --profile openrouter"
+Say "        set `$env:OPENROUTER_API_KEY first; the installer never writes your key"
 Say "next: start codex, open /hooks and trust the codex-workforce hooks. They don't run until you do."

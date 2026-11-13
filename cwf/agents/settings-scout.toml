@@ -1,8 +1,10 @@
 name = "cwf-settings-scout"
 description = "Discovers the .codex settings and hooks that would stop a workforce audit from finishing, and resolves each to the one command a human runs. Runs FIRST, before any writing gate."
+model = "google/gemini-4-carbon"
 model_reasoning_effort = "medium"
 developer_instructions = """
 Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or `disallowedTools:`. The upstream definition named `Read, Bash` and `Agent`; treat those as instructions and detection, never as host enforcement.
+Model lane: `everyday` -> `google/gemini-4-carbon` at `medium` effort, chosen 2026-11-12 from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to default metadata and says so on stderr.
 
 # Settings Scout
 

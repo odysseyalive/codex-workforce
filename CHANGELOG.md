@@ -3,6 +3,175 @@
 The version lives in `VERSION`. Bump it in the same change that alters anything listed in
 `manifest.txt`, and add an entry here.
 
+## 0.1.12 (2026-11-13)
+
+- **Fixed a second pruning defect in `cwf-sync`, found by a peer read rather than by me.**
+  Cleanup after the prune rmdir'd EVERY empty directory under the skills root, so a user's
+  just-made `~/.agents/skills/<anything>/` was removed. Verified before the fix: it printed
+  `removed empty skill dir: .../my-own-empty-dir`. Cleanup is now limited to directories this
+  run actually emptied by pruning a recorded path.
+- Two tests: an empty user directory survives `--execute`, and a directory emptied by the
+  prune still goes. The first fails when the old sweep is restored.
+- cw-dev withdrew an earlier note about the ownership record pruning itself: the loop only
+  walks paths from the prior record and the record is never in `written`. The record is kept in
+  the explicit metadata set anyway, since it sits inside a root the prune walks and a future
+  code path could list it.
+
+## 0.1.11 (2026-11-13)
+
+- **Fixed a live data-loss bug in `cwf-sync` found by running it, not by reasoning about it.**
+  `manifest.txt` and `CHANGELOG.md` are not manifest rows — the script copies them as package
+  metadata — so the ownership record listed them and the prune in the SAME run removed them.
+  Observed on the real install: `pruned /home/francis/.codex/codex-workforce/manifest.txt`.
+  The metadata paths are now named as kept explicitly, and a regression test reproduces the
+  failure when that line is removed.
+- `cwf-sync` also stopped printing its exit code as if it were a file count. `execute()` returns
+  a status; the report now prints the number of files the plan found.
+
+## 0.1.10 (2026-11-13)
+
+- **Fixed a real defect in `cwf-sync`: it pruned by name.** It removed any `cwf-*` skill not in
+  the manifest, which would delete a user's own hand-made `cwf-notes` or a `cwf-*` from another
+  source. claude-workforce's installer forbids exactly this ("a blunt basename match would
+  delete a user's own agent that happened to share a name"). Pruning is now by **ownership**: a
+  previous run records the exact paths it placed, and only recorded paths the manifest no
+  longer lists are removed.
+- Four guards carried from that installer, each with its measured reason: the record is read
+  before writing and **merged** after (a record destroyed by its own run reads as "nothing is
+  ours" forever); a **partial run never prunes**; a recorded agent registration is **kept while
+  another skill still bundles that agent** (upstream pruned one on removing `image-eval`,
+  50f20ec); and pruning is confined to the roots this run just built, never project state.
+- On a first run there is no record, so nothing is pruned and the record is seeded from what
+  the manifest placed. A pre-existing `cwf-*` is then **reported, not deleted**.
+- The `SyncTests` were rewritten around this: one seeds the record and asserts a recorded skill
+  is pruned, and one asserts a foreign `cwf-notes` survives `--execute` and is reported. That
+  second test was shown to fail when the old name-match prune is restored.
+
+## 0.1.9 (2026-11-13)
+
+- New `cwf/bin/cwf-sync`: the port of claude-workforce's `bin/sync --personal`. It mirrors this
+  repo's local tree into the user-root install — `~/.agents/skills/cwf-*`, `~/.codex/agents/`,
+  and `~/.codex/codex-workforce/` — which is the copy a session actually resolves, since the
+  user-root skills root shadows a project one.
+- It exists because `install` fetches from `$CWF_REPO_URL` (default
+  raw.githubusercontent.com/main): with unpushed changes it overwrites the user-root install
+  with the PUBLISHED version and looks successful. `cwf-sync` reads the local tree instead.
+  Measured upstream 2026-08-04; the same trap applies to a maintainer checkout here.
+- It plans by default and needs `--execute`; `--check` exits 1 on drift. It **never creates an
+  install that was not already there**, refuses a skills or agents directory holding only
+  foreign files, and removes a `cwf-*` skill the source no longer has so a stale copy cannot
+  keep loading. Five tests cover those guarantees and were shown to fail when the guards were
+  removed.
+- `cwf-dev` § The release transaction now refreshes the user-root install with `cwf-sync`
+  after regenerating and testing, and says when to use the full `install` transaction instead.
+
+## 0.1.8 (2026-11-13)
+
+- **Layout change: shipped sources are now visible.** The nine skills move from the hidden
+  `.agents/skills/` to `cwf/skills/`, matching claude-workforce, whose sources live in a
+  visible `workforce/` and whose `git ls-files` contains no shipped file under `.claude/` or
+  `.agents/`. A dot-directory is now an install target only. The tree was regenerated and
+  confirmed byte-identical (`diff -r`, 36 files) before the old one was removed.
+- `manifest.txt` states the destination mapping in its header, as upstream's does: two prefix
+  rules (`cwf/skills/<name>/...` -> skills root, `cwf/agents/<name>.toml` -> agents dir,
+  everything else -> install dir). No flag column yet, because no row needs one; the header
+  says when to add it and warns not to copy upstream's retired `bin/check` claim.
+- Both installers map the new prefixes and exclude the skills source from the install
+  directory. A clean install into a throwaway HOME put 9 skills in `~/.agents/skills`, did not
+  duplicate `cwf/skills` into the install dir, and a live reinstall reports 0.1.7+ with
+  `cwf-dev` present.
+- `cwf-dev` gains § Source layout with the rule, the two tables, the flag policy, and what
+  stays hidden on purpose; the blueprint gains a matching standing rule in the user's words.
+
+## 0.1.7 (2026-11-13)
+
+- New `cwf-dev` skill: the port of claude-workforce's `workforce dev` maintainer mode. It
+  carries upstream's self-exclusion rule (the dispatcher is infrastructure, never an
+  employee), the edit-source-first discipline, the upstream inbox, the release transaction,
+  and the three standing Codex losses (no per-agent tool allowlist, no `model_provider` in a
+  custom agent, no built-in router). Authored in `cwf/skills-src/cwf-dev/` and generated into
+  `.agents/skills/cwf-dev/`, so it installs with the other eight.
+- The blueprint gains a standing rule, **origin: user**, to mirror claude-workforce through
+  cw-dev: read the upstream file rather than a summary of it, ask cw-dev about the rule and
+  concept and for the file and line, prefer structural parity over local invention, and
+  record any deliberate divergence with its reason. It records the two that exist
+  (`cwf-implementer`, `cwf-dev` as its own skill) and the exchanges that produced them.
+- AGENTS.md and the tracker now say nine skills and ten agents, and say which of each is
+  authored here rather than generated from the pin.
+
+## 0.1.6 (2026-11-13)
+
+- The prompt hook now injects a **dispatch line** on every main-session prompt, mirroring
+  claude-workforce's `DISPATCH_NO_ORG` / `DISPATCH_LINE` in `wf-task-tag`. It says a job goes
+  to a background plain subagent, names `cwf-implementer` for code, `deadcode-gardener` for a
+  review and `code-design-advisor` for an approach decision, and keeps the inline exception.
+  Advisory, never a gate: nothing refuses. Upstream added the same line after measuring a
+  project that did a whole job in the main thread because nothing said otherwise.
+- An org is a chart carrying the `AUTO-GENERATED` marker that this package's tooling writes; a
+  hand-written chart without it is not one, matching upstream's rule.
+- New `cwf-implementer` agent: the package's only code-writing employee. The pinned upstream
+  set is nine advisors with no implementer, so this one is authored here
+  (`cwf/agents/cwf-implementer.md`) and generated the same way as the rest. It runs on the
+  code lane and its handbook requires `changed:` / `ran:` / `not run:` / `risk:`. Verified
+  live: spawned by type, it added a function, ran a `python3 -c` assertion, and reported the
+  real output, its untracked-file caveat, and a blocked cleanup.
+- `AGENTS.md` gains a routing section with the same ladder, and four tests pin the dispatch
+  context: no-org names the code lane, a marked chart selects the org line, an unmarked chart
+  does not count as an org, and only a main prompt receives it.
+
+## 0.1.5 (2026-11-12)
+
+- `cwf-model-catalog default MODEL` sets the session's default model. It is deliberately
+  separate from `install` so a reinstall can never move someone's default. It sets `model`
+  and `model_provider` together (an OpenRouter id needs the provider that can reach it),
+  refuses an id the package does not ship, is idempotent, and backs the config up first.
+- The shipped catalog grows to 18 models, adding the orchestrator candidates:
+  `z-ai/glm-5.3` (the recommended default), `qwen/qwen3.8-max-0902`, `anthropic/claude-opus-5`,
+  `anthropic/claude-fable-5.1` and `openai/gpt-6-astra`. The default on the author's machine
+  is now `z-ai/glm-5.3`, verified by running a session with no `-m` flag.
+- `x-ai/grok-4.6` is listed as retired rather than shipped. Codex sends `apply_patch` as a
+  Responses tool of type `custom`, and xAI's endpoint rejects the request with 422 before the
+  first token; the model answers fine on other endpoints, so this is a gap between the two
+  sides. A reinstall now removes a retired id from the merged catalog instead of leaving it
+  selectable and broken.
+- Seven more tests cover the new command: install never changes the default, default refuses
+  an unshipped id and a missing provider block, sets model and provider together, is
+  idempotent, honours `--dry-run`, and drops a retired model from the merge.
+
+## 0.1.4 (2026-11-12)
+
+- The recommended OpenRouter models now ship as package content: `cwf/model-catalog.json`
+  carries 16 models (each lane's default, premium and value pick) and `cwf/bin/cwf-model-catalog`
+  installs them into any Codex config. Both installers run it automatically.
+- The models appear with `codex --profile openrouter`. `model_catalog_json` replaces Codex's
+  catalog rather than extending it, and `model_provider` reroutes every model, so the
+  installer writes a profile instead of changing the user's default provider. It merges with
+  any catalog the user already had, backs the file up first, and never writes an API key: the
+  provider names `OPENROUTER_API_KEY` and each user exports their own.
+- `cwf-model-catalog status` and `verify` report whether the catalog, profile and provider
+  block are in place; `verify` exits 1 when a shipped model is missing from the merged file.
+- Seven new `ModelCatalogTests` cover the failure modes that matter: a non-OpenRouter config
+  being left byte-identical, a user's own catalog entry surviving the merge, and a no-op
+  reinstall not churning backups. Verified live: the catalog lists all 16 models, and
+  `glm-5.3-flash`, `muse-spark-1.3` and `haiku-5.5` each ran a prompt with no metadata warning.
+
+## 0.1.3 (2026-11-12)
+
+- Every generated custom agent now pins a model and an effort from the lane its handbook
+  describes, instead of inheriting the session model. The table lives in
+  `scripts/build-skills` (`LANES`, `AGENT_LANES`): everyday work runs
+  `google/gemini-4-carbon`, code runs `anthropic/claude-opus-5.5`, the handbook cold-reader
+  runs `anthropic/claude-opus-5`, and `meta/muse-wonder` is reserved for the visual lane the
+  package does not yet staff. The research and its evidence are in
+  `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6.
+- A new `ModelLaneTests` class fails the suite when an agent loses its pin, pins a model
+  outside the four lane defaults, or (on a machine with a Codex model catalog) carries an
+  `input_modalities` value Codex rejects. That last case is a regression: a catalog entry
+  with `file` in `input_modalities` made every `codex exec` fail to start on 2026-11-12 until
+  it was corrected.
+- `cwf/agents/README.md` now states that a custom agent may set `model` but cannot set
+  `model_provider`, so an OpenRouter pin resolves only when the parent session routes there.
+
 ## 0.1.2 (2026-11-11)
 
 - Codex-only port of the discovery findings: widen's PERF store and handoff lookup now

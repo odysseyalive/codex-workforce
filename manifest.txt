@@ -4,12 +4,30 @@
 # Read by both installers: `install` (bash, Linux/macOS) and `install.ps1` (PowerShell,
 # Windows). tests/test_install.py fails if a runtime file is missing from this list.
 #
-# Paths under .agents/skills/ are installed into the skills directory; everything else
-# goes into the install directory (codex-workforce/ under ~/.codex or the project's .codex).
+# SOURCES ARE VISIBLE, DESTINATIONS ARE NOT. Nothing this package ships is committed under
+# a dot-directory. That mirrors claude-workforce, whose sources sit in `workforce/` and whose
+# `.claude/` holds only an install. Two prefix rules cover every row today:
+#
+#   cwf/skills/<name>/...      -> <skills-root>/<name>/...   (personal ~/.agents/skills,
+#                                                             project .agents/skills)
+#   cwf/agents/<name>.toml     -> <config-root>/agents/<name>.toml  (personal ~/.codex/agents,
+#                                                                   project .codex/agents)
+#   anything else              -> the install directory (<config-root>/codex-workforce,
+#                                 or <project>/.codex/codex-workforce)
+#
+# Add a per-row flag only when a row leaves its prefix rule or needs behaviour a path cannot
+# express; a new prefix is a reason to add the flag, not to infer a destination from it.
+# claude-workforce's flags are the reference: sibling (a whole skill beside workforce/),
+# agent (a registration file), keep (never overwrite a user-edited file), exec (chmod +x),
+# retired (prune only). This package needs none of them yet, so it has no flag column.
+
 VERSION
 RESUME.md
 cwf/bin/cwf-hook
 cwf/bin/cwf-step
+cwf/bin/cwf-model-catalog
+cwf/bin/cwf-sync
+cwf/model-catalog.json
 cwf/bin/wf-code-eval
 cwf/bin/wf-map
 cwf/bin/wf-census
@@ -25,41 +43,43 @@ upstream/claude-workforce/workforce/bin/wf-code-eval
 upstream/claude-workforce/workforce/bin/wf-map
 upstream/claude-workforce/workforce/bin/wf-census
 upstream/claude-workforce/workforce/references/senses.md
-.agents/skills/cwf-blueprint/SKILL.md
-.agents/skills/cwf-code-evaluator/SKILL.md
-.agents/skills/cwf-code-evaluator/references/additions.md
-.agents/skills/cwf-code-evaluator/references/cross-file-detection.md
-.agents/skills/cwf-code-evaluator/references/gotchas.md
-.agents/skills/cwf-code-evaluator/references/guards.md
-.agents/skills/cwf-code-evaluator/references/mistake-taxonomy.md
-.agents/skills/cwf-code-evaluator/references/native-tool-map.md
-.agents/skills/cwf-code-evaluator/references/version.md
-.agents/skills/cwf-records-code-map/SKILL.md
-.agents/skills/cwf-security-evaluator/SKILL.md
-.agents/skills/cwf-security-evaluator/references/cross-file-detection.md
-.agents/skills/cwf-security-evaluator/references/guards.md
-.agents/skills/cwf-security-evaluator/references/native-tool-map.md
-.agents/skills/cwf-security-evaluator/references/security-taxonomy.md
-.agents/skills/cwf-security-evaluator/references/version.md
-.agents/skills/cwf-shared-artifact/SKILL.md
-.agents/skills/cwf-shared-artifact/references/house-style.md
-.agents/skills/cwf-shared-artifact/references/template.html
-.agents/skills/cwf-text-eval/SKILL.md
-.agents/skills/cwf-text-eval/bin/wf-text-scan
-.agents/skills/cwf-text-eval/references/additions.md
-.agents/skills/cwf-text-eval/references/human-markers.md
-.agents/skills/cwf-text-eval/references/text-tells.md
-.agents/skills/cwf-text-eval/references/version.md
-.agents/skills/cwf-timezone/SKILL.md
-.agents/skills/cwf-timezone/bin/wf-timezone
-.agents/skills/cwf-ui-design/SKILL.md
-.agents/skills/cwf-ui-design/references/design-quality-catalog.md
-.agents/skills/cwf-ui-design/references/direction.md
-.agents/skills/cwf-ui-design/references/ergonomics-catalog.md
-.agents/skills/cwf-ui-design/references/rendered-checks.md
-.agents/skills/cwf-ui-design/references/version.md
-.agents/skills/cwf-code-evaluator/agents/code-design-advisor/AGENT.md
-.agents/skills/cwf-code-evaluator/agents/deadcode-gardener/AGENT.md
+cwf/skills/cwf-blueprint/SKILL.md
+cwf/skills/cwf-dev/SKILL.md
+cwf/skills/cwf-code-evaluator/SKILL.md
+cwf/skills/cwf-code-evaluator/references/additions.md
+cwf/skills/cwf-code-evaluator/references/cross-file-detection.md
+cwf/skills/cwf-code-evaluator/references/gotchas.md
+cwf/skills/cwf-code-evaluator/references/guards.md
+cwf/skills/cwf-code-evaluator/references/mistake-taxonomy.md
+cwf/skills/cwf-code-evaluator/references/native-tool-map.md
+cwf/skills/cwf-code-evaluator/references/version.md
+cwf/skills/cwf-records-code-map/SKILL.md
+cwf/skills/cwf-security-evaluator/SKILL.md
+cwf/skills/cwf-security-evaluator/references/cross-file-detection.md
+cwf/skills/cwf-security-evaluator/references/guards.md
+cwf/skills/cwf-security-evaluator/references/native-tool-map.md
+cwf/skills/cwf-security-evaluator/references/security-taxonomy.md
+cwf/skills/cwf-security-evaluator/references/version.md
+cwf/skills/cwf-shared-artifact/SKILL.md
+cwf/skills/cwf-shared-artifact/references/house-style.md
+cwf/skills/cwf-shared-artifact/references/template.html
+cwf/skills/cwf-text-eval/SKILL.md
+cwf/skills/cwf-text-eval/bin/wf-text-scan
+cwf/skills/cwf-text-eval/references/additions.md
+cwf/skills/cwf-text-eval/references/human-markers.md
+cwf/skills/cwf-text-eval/references/text-tells.md
+cwf/skills/cwf-text-eval/references/version.md
+cwf/skills/cwf-timezone/SKILL.md
+cwf/skills/cwf-timezone/bin/wf-timezone
+cwf/skills/cwf-ui-design/SKILL.md
+cwf/skills/cwf-ui-design/references/design-quality-catalog.md
+cwf/skills/cwf-ui-design/references/direction.md
+cwf/skills/cwf-ui-design/references/ergonomics-catalog.md
+cwf/skills/cwf-ui-design/references/rendered-checks.md
+cwf/skills/cwf-ui-design/references/version.md
+cwf/skills/cwf-code-evaluator/agents/code-design-advisor/AGENT.md
+cwf/skills/cwf-code-evaluator/agents/deadcode-gardener/AGENT.md
+cwf/agents/cwf-implementer.toml
 cwf/agents/code-design-advisor.toml
 cwf/agents/content-classifier.toml
 cwf/agents/conversion-auditor.toml

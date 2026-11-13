@@ -181,18 +181,22 @@ done < "$STAGE/manifest.txt"
 
 # ── install ──────────────────────────────────────────────────────────────────
 # Replace the install directory whole, so a file dropped from the manifest disappears.
+# cwf/skills is not install-dir content: it is the visible SOURCE for <skills-root>/<name>/,
+# and it is copied there below. Everything else under cwf/ ships into the install dir.
 rm -rf "$INSTALL_DIR.cwf-new"
 mkdir -p "$INSTALL_DIR.cwf-new" "$SKILLS_DIR"
 for top in "$STAGE"/files/* ; do
-  [ -e "$top" ] && cp -R "$top" "$INSTALL_DIR.cwf-new/"
+  [ -e "$top" ] || continue
+  cp -R "$top" "$INSTALL_DIR.cwf-new/"
 done
+rm -rf "$INSTALL_DIR.cwf-new/cwf/skills"
 rm -rf "$INSTALL_DIR"
 mv "$INSTALL_DIR.cwf-new" "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR"/cwf/bin/* "$INSTALL_DIR"/upstream/claude-workforce/workforce/bin/* 2>/dev/null || true
 
 : > "$INSTALL_DIR/installed-skills.txt"
-if [ -d "$STAGE/files/.agents/skills" ]; then
-  for skill in "$STAGE"/files/.agents/skills/*; do
+if [ -d "$STAGE/files/cwf/skills" ]; then
+  for skill in "$STAGE"/files/cwf/skills/*; do
     name="$(basename "$skill")"
     rm -rf "${SKILLS_DIR:?}/$name"
     cp -R "$skill" "$SKILLS_DIR/$name"
@@ -215,6 +219,14 @@ fi
 
 edit_hooks add
 
+# Make the shipped OpenRouter models selectable. This writes a profile and a merged catalog
+# beside config.toml; it does not change the user's default model or provider. It never
+# writes an API key — the provider names OPENROUTER_API_KEY and each user exports their own.
+if [ -x "$INSTALL_DIR/cwf/bin/cwf-model-catalog" ]; then
+  "$PY" "$INSTALL_DIR/cwf/bin/cwf-model-catalog" install --config "$CONF_DIR" \
+    || say "note: the model catalog step failed; run cwf-model-catalog install by hand"
+fi
+
 if [ "$CURRENT" = unknown ]; then
   say "installed $INCOMING ($SCOPE scope) in $INSTALL_DIR"
 elif [ "$CURRENT" = "$INCOMING" ]; then
@@ -223,4 +235,6 @@ else
   say "updated $CURRENT -> $INCOMING ($SCOPE scope) in $INSTALL_DIR"
 fi
 say "hooks added to $HOOKS_JSON; skills in $SKILLS_DIR"
+say "models: select the shipped OpenRouter set with: codex --profile openrouter"
+say "        export OPENROUTER_API_KEY=sk-or-... first; the installer never writes your key"
 say "next: start codex, open /hooks and trust the codex-workforce hooks. They don't run until you do."

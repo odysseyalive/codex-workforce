@@ -1,8 +1,10 @@
 name = "cwf-content-classifier"
 description = "Classifies a block of skill content by what it DOES \u2014 rule, mechanism, reference, scaffolding, or directive-statement \u2014 so conversion can move it without first resolving who wrote it."
+model = "google/gemini-4-carbon"
 model_reasoning_effort = "high"
 developer_instructions = """
 Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or `disallowedTools:`. The upstream definition named `Read` and `Agent`; treat those as instructions and detection, never as host enforcement.
+Model lane: `everyday` -> `google/gemini-4-carbon` at `high` effort, chosen 2026-11-12 from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to default metadata and says so on stderr.
 
 # Content Classifier
 

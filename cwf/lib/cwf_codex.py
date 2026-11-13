@@ -367,6 +367,54 @@ def resume_context(root, payload):
             "handoff is finished):\n\n" + text)
 
 
+# The dispatch line, mirroring claude-workforce's `DISPATCH_LINE` / `DISPATCH_NO_ORG` in
+# wf-task-tag. Upstream injects it on every UserPromptSubmit that opens an issue; this port
+# injects it on every main-session prompt, because Codex has no equivalent tagger hook and a
+# session that never hears it will do all the work in the main thread. ADVISORY, NEVER A
+# GATE: nothing refuses and nothing blocks. The reasons are upstream's own, measured
+# 2026-11-08: a project without an org did a whole job in the main thread because nothing
+# said a job could go to a subagent at all.
+DISPATCH_INLINE = (" Work inline only when the answer is already in hand or the job is a few "
+                   "tool calls: data in hand that answers the question is itself the answer.")
+DISPATCH_ORG = (" This project has a workforce org. A job in this message goes to the employee "
+                "whose description fits, spawned as a background plain subagent so this "
+                "session stays free for the next message; the spawn is linked to the issue and "
+                "the Work list tracks it until it hands back." + DISPATCH_INLINE)
+DISPATCH_NO_ORG = (" This project has no workforce org, which changes who takes a job and not "
+                   "whether one is handed off. A job in this message goes to a background plain "
+                   "`general-purpose` subagent, spawned so this session stays free for the next "
+                   "message; the spawn is linked to the issue and the Work list tracks it until "
+                   "it hands back." + DISPATCH_INLINE)
+# This package ships a code-writing agent the upstream set lacks, so the no-org line names it
+# when the job is code. It is still a plain subagent for bookkeeping purposes.
+DISPATCH_CODE = (" Code that changes files — a feature, a fix, a refactor, or its tests — goes "
+                 "to `cwf-implementer`; a review of code that already landed goes to "
+                 "`deadcode-gardener`; an approach that needs deciding before writing goes to "
+                 "`code-design-advisor`. Each is one-shot: spawn it, read its report, close it "
+                 "with `close_agent`.")
+ORG_CHART_REL = os.path.join(".codex-workforce", "org-chart.md")
+ORG_MARKER = b"AUTO-GENERATED"
+
+
+def dispatch_context(root):
+    """The advisory dispatch line for a main-session prompt, or "".
+
+    An org is a chart this package's own tooling wrote, carrying the `AUTO-GENERATED` marker;
+    a stray `.codex/agents/*.toml` is not one. Read-only, size-capped, never through a link.
+    """
+    line = DISPATCH_NO_ORG + DISPATCH_CODE
+    path = os.path.join(root, ORG_CHART_REL)
+    try:
+        if not os.path.islink(path) and os.path.isfile(path):
+            with open(path, "rb") as fh:
+                head = fh.read(1024)
+            if ORG_MARKER in head:
+                line = DISPATCH_ORG
+    except OSError:
+        pass
+    return line
+
+
 def normalize_payload(payload):
     """Codex hook input -> the payload the upstream hooks expect. Returns (payload, env).
     Sets `cwf_reply_unmatched` when a Stop's reply never appeared in the transcript, and
@@ -378,6 +426,8 @@ def normalize_payload(payload):
     scratch = state_dir(root, "scratch", sid)
     p["scratchpad_dir"] = scratch
     p["cwf_resume_context"] = resume_context(root, p)
+    p["cwf_dispatch_context"] = (dispatch_context(root)
+                                 if p.get("hook_event_name") == "UserPromptSubmit" else "")
     p["cwf_rollout_path"] = p.get("transcript_path")
     stopping = str(p.get("hook_event_name", "")).endswith("Stop")
     if stopping:

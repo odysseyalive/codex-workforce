@@ -1,0 +1,924 @@
+{
+  "models": [
+    {
+      "id": "z-ai/glm-5.3",
+      "model": "z-ai/glm-5.3",
+      "slug": "z-ai/glm-5.3",
+      "displayName": "Z.ai: GLM 5.3 (OpenRouter)",
+      "display_name": "Z.ai: GLM 5.3 (OpenRouter)",
+      "description": "orchestrator (main session), code, creative writing \u2014 $0.070/$1.40 per 1M",
+      "priority": 0,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "qwen/qwen3.8-max-0902",
+      "model": "qwen/qwen3.8-max-0902",
+      "slug": "qwen/qwen3.8-max-0902",
+      "displayName": "Qwen: Qwen3.8 Max (0902) (OpenRouter)",
+      "display_name": "Qwen: Qwen3.8 Max (0902) (OpenRouter)",
+      "description": "orchestrator (main session) \u2014 $2.000/$6.00 per 1M",
+      "priority": 1,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-opus-5",
+      "model": "anthropic/claude-opus-5",
+      "slug": "anthropic/claude-opus-5",
+      "displayName": "Anthropic: Claude Opus 5 (OpenRouter)",
+      "display_name": "Anthropic: Claude Opus 5 (OpenRouter)",
+      "description": "orchestrator (main session), creative writing \u2014 $5.000/$25.00 per 1M",
+      "priority": 2,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-fable-5.1",
+      "model": "anthropic/claude-fable-5.1",
+      "slug": "anthropic/claude-fable-5.1",
+      "displayName": "Anthropic: Claude Fable 5.1 (OpenRouter)",
+      "display_name": "Anthropic: Claude Fable 5.1 (OpenRouter)",
+      "description": "orchestrator (main session) \u2014 $10.000/$50.00 per 1M",
+      "priority": 3,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "model": "openai/gpt-6-astra",
+      "slug": "openai/gpt-6-astra",
+      "displayName": "OpenAI: GPT-6 Astra (OpenRouter)",
+      "display_name": "OpenAI: GPT-6 Astra (OpenRouter)",
+      "description": "orchestrator (main session), creative writing \u2014 $10.000/$50.00 per 1M",
+      "priority": 4,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1050000,
+      "max_context_window": 1050000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "image",
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "openai/gpt-6.1-terra",
+      "model": "openai/gpt-6.1-terra",
+      "slug": "openai/gpt-6.1-terra",
+      "displayName": "OpenAI: GPT-6.1 Terra (OpenRouter)",
+      "display_name": "OpenAI: GPT-6.1 Terra (OpenRouter)",
+      "description": "everyday work \u2014 $1.000/$5.00 per 1M",
+      "priority": 5,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1050000,
+      "max_context_window": 1050000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "image",
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "google/gemini-4-carbon",
+      "model": "google/gemini-4-carbon",
+      "slug": "google/gemini-4-carbon",
+      "displayName": "Google: Gemini 4 Carbon (OpenRouter)",
+      "display_name": "Google: Gemini 4 Carbon (OpenRouter)",
+      "description": "everyday work \u2014 $2.000/$10.00 per 1M",
+      "priority": 6,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "audio",
+        "image",
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "openai/gpt-6.1-sol",
+      "model": "openai/gpt-6.1-sol",
+      "slug": "openai/gpt-6.1-sol",
+      "displayName": "OpenAI: GPT-6.1 Sol (OpenRouter)",
+      "display_name": "OpenAI: GPT-6.1 Sol (OpenRouter)",
+      "description": "everyday work \u2014 $2.000/$10.00 per 1M",
+      "priority": 7,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1050000,
+      "max_context_window": 1050000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "image",
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-sonnet-5.5",
+      "model": "anthropic/claude-sonnet-5.5",
+      "slug": "anthropic/claude-sonnet-5.5",
+      "displayName": "Anthropic: Claude Sonnet 5.5 (OpenRouter)",
+      "display_name": "Anthropic: Claude Sonnet 5.5 (OpenRouter)",
+      "description": "everyday work \u2014 $2.000/$10.00 per 1M",
+      "priority": 8,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-fable-5.2",
+      "model": "anthropic/claude-fable-5.2",
+      "slug": "anthropic/claude-fable-5.2",
+      "displayName": "Anthropic: Claude Fable 5.2 (OpenRouter)",
+      "display_name": "Anthropic: Claude Fable 5.2 (OpenRouter)",
+      "description": "everyday work \u2014 $8.000/$40.00 per 1M",
+      "priority": 9,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-haiku-5.5",
+      "model": "anthropic/claude-haiku-5.5",
+      "slug": "anthropic/claude-haiku-5.5",
+      "displayName": "Anthropic: Claude Haiku 5.5 (OpenRouter)",
+      "display_name": "Anthropic: Claude Haiku 5.5 (OpenRouter)",
+      "description": "everyday work \u2014 $0.100/$0.50 per 1M",
+      "priority": 10,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "meta/muse-spark-1.3",
+      "model": "meta/muse-spark-1.3",
+      "slug": "meta/muse-spark-1.3",
+      "displayName": "Meta: Muse Spark 1.3 (OpenRouter)",
+      "display_name": "Meta: Muse Spark 1.3 (OpenRouter)",
+      "description": "creative visual work, code \u2014 $1.250/$4.25 per 1M",
+      "priority": 11,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "moonshotai/kimi-k3.1-pro",
+      "model": "moonshotai/kimi-k3.1-pro",
+      "slug": "moonshotai/kimi-k3.1-pro",
+      "displayName": "MoonshotAI: Kimi K3.1 Pro (OpenRouter)",
+      "display_name": "MoonshotAI: Kimi K3.1 Pro (OpenRouter)",
+      "description": "creative visual work, creative writing \u2014 $0.237/$8.79 per 1M",
+      "priority": 12,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "meta/muse-wonder",
+      "model": "meta/muse-wonder",
+      "slug": "meta/muse-wonder",
+      "displayName": "Meta: Muse Wonder (OpenRouter)",
+      "display_name": "Meta: Muse Wonder (OpenRouter)",
+      "description": "creative visual work \u2014 $4.000/$20.00 per 1M",
+      "priority": 13,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image",
+        "audio"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "anthropic/claude-opus-5.5",
+      "model": "anthropic/claude-opus-5.5",
+      "slug": "anthropic/claude-opus-5.5",
+      "displayName": "Anthropic: Claude Opus 5.5 (OpenRouter)",
+      "display_name": "Anthropic: Claude Opus 5.5 (OpenRouter)",
+      "description": "creative visual work, code \u2014 $4.000/$20.00 per 1M",
+      "priority": 14,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1000000,
+      "max_context_window": 1000000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "z-ai/glm-5.3-flash",
+      "model": "z-ai/glm-5.3-flash",
+      "slug": "z-ai/glm-5.3-flash",
+      "displayName": "Z.ai: GLM 5.3 Flash (OpenRouter)",
+      "display_name": "Z.ai: GLM 5.3 Flash (OpenRouter)",
+      "description": "code \u2014 $0.040/$0.08 per 1M",
+      "priority": 15,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "deepseek/deepseek-v4-flash-0731",
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "slug": "deepseek/deepseek-v4-flash-0731",
+      "displayName": "DeepSeek: DeepSeek V4 Flash 0731 (OpenRouter)",
+      "display_name": "DeepSeek: DeepSeek V4 Flash 0731 (OpenRouter)",
+      "description": "code \u2014 $0.043/$0.30 per 1M",
+      "priority": 16,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1048576,
+      "max_context_window": 1048576,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "high",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    },
+    {
+      "id": "openai/gpt-6-sol",
+      "model": "openai/gpt-6-sol",
+      "slug": "openai/gpt-6-sol",
+      "displayName": "OpenAI: GPT-6 Sol (OpenRouter)",
+      "display_name": "OpenAI: GPT-6 Sol (OpenRouter)",
+      "description": "creative writing \u2014 $2.000/$10.00 per 1M",
+      "priority": 17,
+      "visibility": "list",
+      "supported_in_api": true,
+      "context_window": 1050000,
+      "max_context_window": 1050000,
+      "effective_context_window_percent": 95,
+      "input_modalities": [
+        "image",
+        "text"
+      ],
+      "supported_reasoning_levels": [
+        {
+          "effort": "high",
+          "description": "Most thorough"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced"
+        },
+        {
+          "effort": "low",
+          "description": "Faster"
+        }
+      ],
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "shell_type": "shell_command",
+      "supports_image_detail_original": true,
+      "supports_parallel_tool_calls": false,
+      "supports_reasoning_summaries": false,
+      "supports_search_tool": false,
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "base_instructions": "You are Codex, a coding agent.",
+      "experimental_supported_tools": [],
+      "service_tiers": [],
+      "additional_speed_tiers": [],
+      "upgrade": null,
+      "availability_nux": null
+    }
+  ]
+}

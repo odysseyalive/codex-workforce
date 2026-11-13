@@ -19,7 +19,10 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UP = os.path.join(ROOT, "upstream", "claude-workforce", "workforce", "skills")
-OUT = os.path.join(ROOT, ".agents", "skills")
+# Shipped skills are generated into a VISIBLE tree, like upstream's workforce/skills/.
+# A dot-directory is an install target only: nothing this package ships is committed under
+# .agents/ or .codex/. install maps these two prefixes to the hidden host paths.
+OUT = os.path.join(ROOT, "cwf", "skills")
 AGENT_OUT = os.path.join(ROOT, "cwf", "agents")
 BIN_OUT = os.path.join(ROOT, "cwf", "bin")
 # Upstream scripts the shipped skills call by path. They are copied out of the
@@ -34,6 +37,47 @@ SKILLS = ("blueprint", "code-evaluator", "records-code-map", "security-evaluator
 WORKFORCE_AGENTS = ("content-classifier", "conversion-auditor", "doctrine-auditor",
                     "handbook-cold-reader", "headcount-skeptic", "provenance-analyst",
                     "settings-scout")
+
+# Model lanes, resolved per agent by the work its handbook describes. The IDs are
+# OpenRouter models and exist in the Codex model catalog; a custom agent cannot set
+# `model_provider`, so a pin only resolves when the parent session routes to OpenRouter.
+# See .codex-workforce/plans/codex-conversion-completion.md § Stage 6.
+LANES = {
+    # Defaults for the three lanes the user named, plus code for the code agents.
+    "everyday": {"model": "google/gemini-4-carbon", "effort": "medium"},
+    "creative-visual": {"model": "meta/muse-wonder", "effort": "medium"},
+    "creative-text": {"model": "anthropic/claude-opus-5", "effort": "medium"},
+    "code": {"model": "anthropic/claude-opus-5.5", "effort": "high"},
+}
+# Every employee the generator emits, with the lane its described work falls in. The
+# reasoning-effort value the upstream handbook states is superseded by the lane's, because
+# the lane is the setting the tracker sanctions; the pin is recorded in each TOML header.
+# An agent the package authors itself, because the pinned upstream set has no implementer:
+# all nine upstream handbooks are advisors/reviewers. Same markdown-with-frontmatter shape as
+# upstream, so it goes through the same generator and lands in .codex/agents/ with the rest.
+LOCAL_AGENT_SOURCES = {
+    "cwf-implementer": os.path.join(ROOT, "cwf", "agents", "cwf-implementer.md"),
+}
+
+# Skills this package authors itself. The upstream pin has no `dev` skill as a standalone
+# skill (it is a command inside `workforce`), so the Codex port ships its own maintainer
+# skill. Copied verbatim into cwf/skills/, same shape as the generated ones.
+LOCAL_SKILLS = {
+    "cwf-dev": os.path.join(ROOT, "cwf", "skills-src", "cwf-dev"),
+}
+
+AGENT_LANES = {
+    "cwf-implementer": "code",
+    "code-design-advisor": "code",
+    "deadcode-gardener": "code",
+    "content-classifier": "everyday",
+    "conversion-auditor": "everyday",
+    "doctrine-auditor": "everyday",
+    "headcount-skeptic": "everyday",
+    "provenance-analyst": "everyday",
+    "settings-scout": "everyday",
+    "handbook-cold-reader": "creative-text",
+}
 
 # Text every copied file gets. Ordering matters: the long script resolver forms first.
 COMMON = [
@@ -243,7 +287,11 @@ def build_agent(src, slug, out_path):
     fields, body = parse_frontmatter(text)
     name = fields.get("name") or slug.replace("-", "_")
     desc = fields.get("description") or ""
-    effort = fields.get("effort") or ""
+    lane = AGENT_LANES.get(slug)
+    if lane is None:
+        raise SystemExit(f"{slug}: no lane assigned; add it to AGENT_LANES")
+    seat = LANES[lane]
+    effort = fields.get("effort") or seat["effort"]
     # The upstream agent names carry the wf- namespace; Codex's built-ins and the
     # generated skill rows use cwf-. Keep the name stable and collision-free.
     codex_name = "cwf-" + name[len("wf-"):] if name.startswith("wf-") else name
@@ -251,13 +299,19 @@ def build_agent(src, slug, out_path):
         f'name = {json.dumps(codex_name)}',
         f'description = {json.dumps(desc)}',
     ]
+    out.append(f'model = {json.dumps(seat["model"])}')
     if effort:
         out.append(f'model_reasoning_effort = "{effort}"')
     notes = ("Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or "
              "`disallowedTools:`. The upstream definition named "
              f"`{fields.get('tools', '(none)')}` and `{fields.get('disallowedTools', '(none)')}`; "
              "treat those as instructions and detection, never as host enforcement.")
-    out.append('developer_instructions = """\n' + notes + "\n\n" + body.strip() + '\n"""')
+    pin = (f"Model lane: `{lane}` -> `{seat['model']}` at `{effort}` effort, chosen 2026-11-12 "
+           "from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` "
+           "§ Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when "
+           "the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to "
+           "default metadata and says so on stderr.")
+    out.append('developer_instructions = """\n' + notes + "\n" + pin + "\n\n" + body.strip() + '\n"""')
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(out) + "\n")
@@ -350,10 +404,24 @@ def main():
             raise SystemExit(f"{slug}: bundled AGENT.md is missing")
         print("built", os.path.relpath(build_agent(
             src, slug, os.path.join(AGENT_OUT, slug + ".toml")), ROOT))
+    # Skills the package authors itself.
+    for slug, src in LOCAL_SKILLS.items():
+        dest = os.path.join(OUT, slug)
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest)
+        print("built", os.path.relpath(os.path.join(dest, "SKILL.md"), ROOT))
+    # Agents the package authors itself (the upstream pin has no implementer).
+    for slug, src in LOCAL_AGENT_SOURCES.items():
+        if not os.path.isfile(src):
+            raise SystemExit(f"{slug}: local agent source is missing: {src}")
+        print("built", os.path.relpath(build_agent(
+            src, slug, os.path.join(AGENT_OUT, slug + ".toml")), ROOT))
     for name in SKILL_BINS:
         print("built", os.path.relpath(build_bin(name), ROOT))
     check()
-    print(json.dumps({"skills": len(SKILLS), "agents": 9, "bins": len(SKILL_BINS)},
+    print(json.dumps({"skills": len(SKILLS) + len(LOCAL_SKILLS),
+                      "agents": 9 + len(LOCAL_AGENT_SOURCES),
+                      "bins": len(SKILL_BINS)},
                      separators=(",", ":")))
     return 0
 

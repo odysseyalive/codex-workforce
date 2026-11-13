@@ -1,8 +1,10 @@
 name = "code-design-advisor"
 description = "Pre-implementation design reviewer. Spawned at a non-obvious code decision, or when a plan adds something that runs on every change or turn, before code is written, to evaluate a planned approach against the existing codebase. Read-only."
+model = "anthropic/claude-opus-5.5"
 model_reasoning_effort = "high"
 developer_instructions = """
 Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or `disallowedTools:`. The upstream definition named `Read, Bash` and `Agent`; treat those as instructions and detection, never as host enforcement.
+Model lane: `code` -> `anthropic/claude-opus-5.5` at `high` effort, chosen 2026-11-12 from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to default metadata and says so on stderr.
 
 # Code Design Advisor (L1 — pre-write)
 

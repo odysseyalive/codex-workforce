@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""cwf-sync — mirror this repo's shipped files into the user-root install.
+
+    python3 cwf/bin/cwf-sync              # plan: report drift, change nothing
+    python3 cwf/bin/cwf-sync --execute    # refresh ~/.codex/codex-workforce + skills/agents
+    python3 cwf/bin/cwf-sync --check      # read-only; exit 1 on drift
+
+This is the Codex port of claude-workforce's `bin/sync --personal`. In maintainer mode you
+edit the SOURCE tree, then mirror it to the copy sessions actually resolve. Two copies
+matter here and they resolve in this order:
+
+    ~/.agents/skills/cwf-*/        the user-root skill install   (SHADOWS a project copy)
+    ~/.codex/agents/*.toml         the user-root agent install
+    ~/.codex/codex-workforce/      the user-root package copy
+
+WHY THIS EXISTS. `install` fetches from `$CWF_REPO_URL`, which defaults to
+raw.githubusercontent.com/main. With unpushed local changes that overwrites the user-root
+install with the PUBLISHED version: it looks like a successful refresh and installs stale
+code. Measured upstream 2026-08-04, and the same trap is here — a maintainer checkout is
+ahead of origin most of the time. This script reads the local tree instead.
+
+WHY IT IS NOT AUTOMATIC. It writes and prunes paths outside the repo. A deliberate gesture is
+the point, so it plans by default and needs `--execute`. It also NEVER CREATES an install that
+was not already there: a machine without one is what `install` is for.
+
+PRUNE BY OWNERSHIP, NEVER BY NAME. It removes only paths a previous run RECORDED placing and
+the manifest no longer lists. A name match would delete a user's own `cwf-notes` skill, and
+claude-workforce's installer forbids exactly that ("a blunt basename match would delete a
+user's own agent that happened to share a name"). Four guards, each carried from that
+installer, each with its measured reason:
+
+  1. The record is read BEFORE anything is written and MERGED afterwards, never replaced. A
+     record destroyed by the run that needed it reads as "nothing is ours" forever
+     (claude-workforce measured this on its live personal install).
+  2. A partial run never prunes. If any copy failed, "everything not in the set" includes
+     working files whose replacements never arrived.
+  3. A recorded agent registration is KEPT while another skill on that root still bundles an
+     agent with the same name. Removing `image-eval` upstream pruned a registration another
+     skill still needed (50f20ec).
+  4. It never walks project state, and it refuses a root other than the one it just built.
+
+FIRST RUN: there is no record, so nothing is pruned and the record is seeded from what the
+manifest placed. A pre-existing `cwf-*` that the manifest does not list is REPORTED, not
+deleted.
+
+Exit: 0 ok / 1 drift found by --check / 2 usage or unsafe target.
+"""
+import argparse
+import filecmp
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CONFIG_ROOT = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+SKILLS_ROOT = os.environ.get("CWF_SKILLS_ROOT") or os.path.expanduser("~/.agents/skills")
+PACKAGE_ROOT = os.path.join(CONFIG_ROOT, "codex-workforce")
+AGENTS_ROOT = os.path.join(CONFIG_ROOT, "agents")
+# The ownership record. It lives in the package dir, which this script owns outright and does
+# not delete, so it survives the run that reads it — the failure claude-workforce measured.
+RECORD = os.path.join(PACKAGE_ROOT, ".cwf-sync-ownership")
+
+
+def read_record():
+    """Paths a previous run placed, one per line. Read BEFORE any write."""
+    try:
+        with open(RECORD, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def merge_record(prior, written):
+    """Merge, never replace: a path that drops out can never be pruned again."""
+    out, seen = [], set()
+    for path in list(prior) + list(written):
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    try:
+        os.makedirs(os.path.dirname(RECORD), exist_ok=True)
+        with open(RECORD, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        print(f"  ! could not write the ownership record {RECORD}: {exc}")
+
+
+def still_bundled(agent_path, kept_skill_dirs):
+    """True when a skill we are keeping still bundles an agent of this name (guard 3)."""
+    name = os.path.splitext(os.path.basename(agent_path))[0]
+    for skill in kept_skill_dirs:
+        candidate = os.path.join(SKILLS_ROOT, skill, "agents", name, "AGENT.md")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def manifest():
+    path = os.path.join(ROOT, "manifest.txt")
+    if not os.path.isfile(path):
+        sys.exit("no manifest.txt — run from the repo root")
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                rows.append(line)
+    return rows
+
+
+def destination(rel):
+    """Where a manifest row installs, per the manifest's own prefix rules."""
+    if rel.startswith("cwf/skills/"):
+        rest = rel[len("cwf/skills/"):]
+        skill, _, tail = rest.partition("/")
+        return os.path.join(SKILLS_ROOT, skill, tail) if tail else os.path.join(SKILLS_ROOT, skill)
+    if rel.startswith("cwf/agents/") and rel.endswith(".toml"):
+        return os.path.join(AGENTS_ROOT, os.path.basename(rel))
+    return os.path.join(PACKAGE_ROOT, rel)
+
+
+def installed():
+    """Which installs already exist. This never creates one."""
+    return {
+        "package": os.path.isdir(PACKAGE_ROOT),
+        "skills": os.path.isdir(SKILLS_ROOT),
+        "agents": os.path.isdir(AGENTS_ROOT),
+    }
+
+
+def plan(rows):
+    have = installed()
+    drift, absent = [], []
+    for rel in rows:
+        dest = destination(rel)
+        if rel.startswith("cwf/skills/") and not have["skills"]:
+            absent.append(rel); continue
+        if rel.startswith("cwf/agents/") and not have["agents"]:
+            absent.append(rel); continue
+        if not rel.startswith(("cwf/skills/", "cwf/agents/")) and not have["package"]:
+            absent.append(rel); continue
+        src = os.path.join(ROOT, rel)
+        if not os.path.isfile(src):
+            drift.append(f"{rel}: missing from the source tree")
+        elif not os.path.isfile(dest):
+            drift.append(f"{rel}: not installed at {dest}")
+        elif not filecmp.cmp(src, dest, shallow=False):
+            drift.append(f"{rel}: differs from {dest}")
+    return drift, absent
+
+
+def verify_targets():
+    """Refuse to delete-then-rebuild a path that is not one of our installs."""
+    if os.path.isdir(SKILLS_ROOT):
+        names = os.listdir(SKILLS_ROOT)
+        mine = [d for d in names if d.startswith("cwf-")]
+        if names and not mine:
+            print(f"REFUSING — {SKILLS_ROOT} holds other skills but none starting cwf-, "
+                  "so it is not ours to replace.")
+            return False
+    if os.path.isdir(AGENTS_ROOT):
+        names = os.listdir(AGENTS_ROOT)
+        tomls = [f for f in names if f.endswith(".toml")]
+        if names and not tomls:
+            print(f"REFUSING — {AGENTS_ROOT} holds files but no agent TOML; leaving it alone.")
+            return False
+    return True
+
+
+def execute(rows):
+    """Mirror the manifest, then prune ONLY what a previous run recorded placing."""
+    have = installed()
+    prior = read_record()          # guard 1: before any write
+    if not any(have.values()):
+        print("no user-root install found; run ./install --user first "
+              "(this never creates one)", file=sys.stderr)
+        return 2
+    if not verify_targets():
+        return 2
+
+    written, skill_dirs, failed = [], set(), 0
+    for rel in rows:
+        if rel.startswith("cwf/skills/"):
+            if not have["skills"]:
+                continue
+            skill_dirs.add(rel.split("/")[2])
+        elif rel.startswith("cwf/agents/") and not have["agents"]:
+            continue
+        elif not rel.startswith(("cwf/skills/", "cwf/agents/")) and not have["package"]:
+            continue
+        src = os.path.join(ROOT, rel)
+        dest = destination(rel)
+        if not os.path.isfile(src):
+            print(f"{rel}: missing from the source tree; the manifest names a file that is not there",
+                  file=sys.stderr)
+            failed += 1
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(src, dest)
+            written.append(dest)
+        except OSError as exc:
+            print(f"  ! could not write {dest}: {exc}", file=sys.stderr)
+            failed += 1
+    # Keep the package's own metadata honest about what it holds.
+    for rel in ("VERSION", "CHANGELOG.md", "manifest.txt"):
+        src, dest = os.path.join(ROOT, rel), os.path.join(PACKAGE_ROOT, rel)
+        if os.path.isfile(src) and have["package"]:
+            try:
+                shutil.copy2(src, dest); written.append(dest)
+            except OSError as exc:
+                print(f"  ! could not write {dest}: {exc}", file=sys.stderr)
+                failed += 1
+
+    # guard 2: a partial run never prunes.
+    if failed:
+        merge_record(prior, written)
+        print(f"{failed} file(s) could not be written; nothing pruned this run")
+        return 1
+
+    # guard 4: prune only inside the roots this run just built.
+    allowed = []
+    if have["skills"]:
+        allowed.append(os.path.abspath(SKILLS_ROOT) + os.sep)
+    if have["agents"]:
+        allowed.append(os.path.abspath(AGENTS_ROOT) + os.sep)
+    if have["package"]:
+        allowed.append(os.path.abspath(PACKAGE_ROOT) + os.sep)
+
+    current = {os.path.abspath(p) for p in written}
+    # Package files this script writes but the manifest does not list. They must be named kept
+    # explicitly or the prune removes what the run just wrote. Found live 2026-11-13:
+    # manifest.txt was pruned on the same run.
+    #
+    # THE OWNERSHIP RECORD BELONGS HERE TOO (cw-dev, 2026-11-13). It sits inside the package
+    # dir, which is one of the roots this prune walks. A record that lists its own path — from a
+    # hand edit, a future code path, or a merge bug — would be pruned, and the next run would
+    # read its absence as "first run", prune nothing, and never recover. That is the silent
+    # failure claude-workforce's _record_lines() warns about. Verified before this fix: the
+    # prune printed `pruned .../.cwf-sync-ownership`; only the later merge rewrote the file.
+    metadata = {os.path.abspath(os.path.join(PACKAGE_ROOT, n))
+                for n in ("VERSION", "CHANGELOG.md", "manifest.txt")}
+    metadata.add(os.path.abspath(RECORD))
+    manifest_dests = {os.path.abspath(destination(r)) for r in rows} | metadata
+    kept_skills = {d for d in skill_dirs}
+    pruned = 0
+    pruned_paths = []
+    for path in prior:
+        abspath = os.path.abspath(path)
+        # Owned, but no longer shipped, and inside a root this run built.
+        if abspath in manifest_dests or not os.path.exists(abspath):
+            continue
+        if not any(abspath.startswith(root) for root in allowed):
+            continue
+        if abspath.startswith(os.path.abspath(AGENTS_ROOT) + os.sep):
+            bundled = still_bundled(abspath, kept_skills)   # guard 3
+            if bundled:
+                print(f"kept {abspath}: {bundled} still bundles it")
+                continue
+        try:
+            os.remove(abspath)
+            pruned += 1
+            pruned_paths.append(abspath)
+            print(f"pruned {abspath}")
+        except OSError as exc:
+            print(f"  ! could not prune {abspath}: {exc}", file=sys.stderr)
+            failed += 1
+    # Remove a skill directory only when this run pruned the LAST path in it. Anything else
+    # belongs to the user: an empty `~/.agents/skills/<anything>/` they just made must survive
+    # (cw-dev, 2026-11-13 — the earlier version rmdir'd every empty dir under the root).
+    candidates = set()
+    for path in pruned_paths:
+        candidate = os.path.dirname(os.path.abspath(path))
+        while (candidate.startswith(os.path.abspath(SKILLS_ROOT) + os.sep)
+               and os.path.abspath(candidate) != os.path.abspath(SKILLS_ROOT)):
+            candidates.add(candidate)
+            candidate = os.path.dirname(candidate)
+    for full in sorted(candidates, key=len, reverse=True):
+        try:
+            if os.path.isdir(full) and not os.listdir(full):
+                os.rmdir(full)
+                print(f"removed empty skill dir: {full}")
+        except OSError:
+            pass
+
+    merge_record(prior, written)   # guard 1: merge, and keep pruned rows out
+    # Drop pruned paths from the record so a re-added file is recorded fresh.
+    merged = [line for line in read_record() if os.path.exists(line) or line in current]
+    try:
+        with open(RECORD, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(merged) + "\n")
+    except OSError:
+        pass
+
+    # Report, never delete, a cwf-* the manifest does not list and we never recorded.
+    if have["skills"]:
+        recorded_roots = {os.path.abspath(p) for p in prior}
+        for name in sorted(os.listdir(SKILLS_ROOT)):
+            full = os.path.abspath(os.path.join(SKILLS_ROOT, name))
+            if not os.path.isdir(full) or not name.startswith("cwf-") or name in skill_dirs:
+                continue
+            ours = any(path == full or path.startswith(full + os.sep) or
+                       path == os.path.join(full, "SKILL.md") for path in recorded_roots)
+            if not ours:
+                print(f"not ours, left alone: {full}")
+    return 0 if not failed else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Mirror the local tree into the user-root install.")
+    ap.add_argument("--execute", action="store_true", help="write; without it this only plans")
+    ap.add_argument("--check", action="store_true", help="exit 1 if anything drifted")
+    args = ap.parse_args()
+
+    rows = manifest()
+    have = installed()
+    # Check this BEFORE reporting "in sync": with nothing installed there is no drift to
+    # find, and "in sync" would read as success on a machine that has no install at all.
+    if args.execute and not any(have.values()):
+        print("no user-root install found; run ./install --user first "
+              "(this never creates one)", file=sys.stderr)
+        return 2
+    drift, absent = plan(rows)
+    print(f"source: {ROOT}")
+    print("installs found: " + (", ".join(k for k, v in have.items() if v) or "none"))
+    if absent:
+        print(f"not installed on this machine (skipped): {len(absent)} file(s) — an install "
+              "never creates what was not already there")
+    label = "DRIFT " if args.check else ("refresh " if args.execute else "would refresh ")
+    for line in drift:
+        print(label + line)
+    if not drift:
+        print("in sync")
+        return 0
+    if args.check:
+        return 1
+    if not args.execute:
+        print(f"{len(drift)} file(s) to refresh; re-run with --execute to write")
+        return 1
+    status = execute(rows)
+    if status:
+        return status
+    print(f"refreshed {len(drift)} file(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

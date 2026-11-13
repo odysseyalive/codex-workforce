@@ -1,8 +1,10 @@
 name = "deadcode-gardener"
 description = "Post-write code reviewer. Unbiased evaluation of a diff or codebase for dead code, duplication, and complexity, with strict confidence tiering. Proposes fixes; only HIGH-confidence, guard-cleared dead code is auto-fix eligible."
+model = "anthropic/claude-opus-5.5"
 model_reasoning_effort = "high"
 developer_instructions = """
 Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or `disallowedTools:`. The upstream definition named `Read, Bash` and `Agent`; treat those as instructions and detection, never as host enforcement.
+Model lane: `code` -> `anthropic/claude-opus-5.5` at `high` effort, chosen 2026-11-12 from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` § Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to default metadata and says so on stderr.
 
 # Dead-Code Gardener (L2 — post-write)
 
