@@ -1,76 +1,68 @@
-# Resume: codex-workforce, 0.1.12
+# Resume: codex-workforce, 0.1.14
 
-Status: handoff written 2026-11-13 at the 0.1.12 release commit. Replace it when the next
-session's work is merged. This file is tracked; the trusted `cwf-hook prompt` injects it on the
-first main-session prompt, and not into subagents or Stop-feedback continuations.
+Status: handoff written 2026-11-13 after committing release 0.1.14. Replace it when the next
+session's work is merged. The trusted `cwf-hook prompt` injects it on the first main-session
+prompt, not into subagents or Stop-feedback continuations.
 
 ## Where the project stands
 
 - Repo: `/home/francis/lab/codex-workforce`
-- HEAD: run `git log -1 --oneline`. The 0.1.12 release commit is `44cd158`, one ahead of
-  `origin/main` and **not pushed**.
-- VERSION: `0.1.12`; tests: `python3 -m unittest discover -s tests -v` -> **77 OK**.
-- Supported host: **Codex only**. Crush was cut on 2026-11-11.
+- HEAD: `3ea3e30` (`0.1.14`), two commits ahead of `origin/main` and **not pushed**.
+- Tests: `python3 -m unittest discover -s tests -v` -> **117 OK**.
+- Stage: **Stage 1 — local work-management core**. Stage 0 is closed.
 - Upstream pin: `52cdfe7e4d61d4b82d5d6cbd7c673f684eec3a86`. Do not edit `upstream/`;
   `tests/` fails on drift.
 
-## What this session added (0.1.3 - 0.1.12)
+## What just landed
 
-- **Model lanes.** Every generated agent pins a model and effort from its lane
-  (`scripts/build-skills` `LANES`/`AGENT_LANES`). `cwf/model-catalog.json` (18 models) and
-  `cwf/bin/cwf-model-catalog` put them in any Codex config as a merged catalog plus an
-  `openrouter` profile. `cwf-model-catalog default MODEL` is the only command that changes what
-  sessions run on. The API key is never written; the provider names `OPENROUTER_API_KEY`.
-- **The live install** runs on `z-ai/glm-5.3` by default, with `--profile openrouter` available.
-  `codex debug models` lists the set.
-- **Routing.** `cwf_codex.dispatch_context()` feeds `cwf-hook prompt`, which injects the
-  dispatch line on every main-session prompt: a no-org project sends a job to a background
-  plain subagent, code goes to `cwf-implementer`, reviews to `deadcode-gardener`, pre-write
-  decisions to `code-design-advisor`. Advisory, never a gate.
-- **`cwf-implementer`** is the package's only code-writing agent, authored here because the
-  pinned upstream set is nine advisors.
-- **`cwf-dev`** ports `workforce dev`: self-exclusion, edit-source-first, upstream inbox,
-  release transaction, the three standing Codex losses. User-typed only.
-- **`cwf/bin/cwf-sync`** ports `bin/sync --personal`: mirrors the local tree into the user-root
-  install (which shadows a project copy), because `./install` fetches from GitHub and would
-  install the published version. Plans by default; `--execute` writes; `--check` exits 1 on
-  drift.
-- **Layout.** Shipped sources live in `cwf/skills/` (visible), not `.agents/skills/` (hidden).
-  A dot-directory is an install target only; `manifest.txt` states the prefix mapping.
+### 0.1.13 — Stage 0 closed
 
-## Read before working
+- Fixed the measured false-pass paths: `wait_agent`/`close_agent` no longer count as outside
+  evidence; a Claude org chart is invisible to Codex; each prompt gets one dispatch line; a
+  truncated rollout is "not judged"; a same-named Claude handbook cannot cap a Codex agent.
+- `RESUME.md` is injected on the first prompt only.
+- Repaired `cwf-timezone`: it now writes `shell_environment_policy.set.TZ` in the user's
+  `config.toml`, the mechanism Codex actually reads. Measured through `codex sandbox`.
+- Added the live `SubagentStop` fixture and a hook-trust hash checker; the installer says
+  whether re-trust is needed.
+- Install updates now prune dropped skills/agents and preserve a user's own same-named agent.
 
-1. `AGENTS.md` — the package rules, routing table, layout.
-2. `.codex-workforce/plans/codex-conversion-completion.md` — the living tracker. Start with
-   **Status**, then the three **Standing rules**, then Stage 6 for the model research.
-3. `cwf/skills-src/cwf-dev/SKILL.md` — maintainer mode. Invoke it only when the user names it.
+### 0.1.14 — project agent registration
 
-## Next open items
+- `cwf/bin/cwf-org register HANDBOOK.md ... [--execute]` renders handbooks to
+  `<project>/.codex/agents/<name>.toml`; `cwf-org check` reports shadowing, symlinks,
+  unparseable files, and duplicate names.
+- Shared writer `cwf/lib/cwf_agents.py`; `scripts/build-skills` uses it, so shipped and
+  project agents use the same TOML escaping.
+- Guards: symlinked paths, unsafe names, infrastructure/shipped names, user-scope shadowing,
+  adopted files, duplicate project names, malformed/multi-line frontmatter, non-UTF-8 TOML,
+  and a project whose `.codex` is the user Codex home.
+- Independent `deadcode-gardener` review found five defects; all are fixed with tests.
 
-- `C0.1` — the Codex capability matrix (Stage 0; unchanged from the last session).
-- `M11` — repin the two code agents from `claude-opus-5.5` to `z-ai/glm-5.3` (value evidence in
-  Stage 6; needs the user's call).
-- `M12` — whether the six everyday agents move from `gemini-4-carbon` to `gpt-6.1-terra`.
-- `M9` — the writing A/B, which needs the user's own briefs.
-- Stage 0's `C0.4`-`C0.9` P0 fixes from the independent review are still open.
+## Next item: `C1.2` chart generation
 
-## Working with cw-dev
+The living tracker owns state:
 
-`claude-workforce` is the reference implementation. Ask it about the rule and the concept, and
-for the file and line — not for an implementation:
+`.codex-workforce/plans/codex-conversion-completion.md`
 
-    agent-say --why "<reason>" --from codex-dev cw-dev "<question>"
+Start with **Status**, then Stage 1. `C1.2` adds chart generation at
+`.codex-workforce/org-chart.md` with roster, scopes, chain of command, and the
+`AUTO-GENERATED` marker, wired to the `cwf-org` generator from `C1.1`.
 
-Delivery is not proven by an exit code; confirm with `agent-say read`. Four exchanges are
-recorded in the tracker's standing rule, including three corrections that changed the code:
-no `/org` exists before an audit; prune by ownership, never by name; and empty-directory
-cleanup must touch only what that run pruned.
+Read before working:
 
-## Cautions
+1. `AGENTS.md`
+2. `.codex-workforce/plans/codex-conversion-completion.md` — Status and Stage 1
+3. `cwf/skills-src/cwf-dev/SKILL.md` — maintainer mode; invoke only when the user names it
 
-- `./install` with no `CWF_REPO_URL` fetches `main` from GitHub, which is behind this tree; it
-  refuses a downgrade. Use `CWF_REPO_URL=file://$PWD ./install` for the full transaction, or
-  `python3 cwf/bin/cwf-sync --execute` for the user-root refresh.
-- Re-trust the hooks in `/hooks` after any `.codex/hooks.json` change.
-- `.codex-workforce/` is git-ignored runtime state. The tracker lives there on purpose.
-- `x-ai/grok-4.6` is retired: Codex sends a `custom` apply_patch tool xAI rejects with 422.
+## Working rules and cautions
+
+- Change behaviour in `cwf/`, never in `upstream/`.
+- Run the tests after every change to `cwf/` or `.codex/hooks.json`.
+- Any manifest-listed file change bumps `VERSION` and adds a `CHANGELOG.md` entry.
+- Refresh the user-root install with `python3 cwf/bin/cwf-sync --execute`; `--check` must say
+  `in sync`.
+- Re-trust hooks in `/hooks` after any `.codex/hooks.json` change.
+- `./install` fetches published code by default; in this checkout use
+  `CWF_REPO_URL=file://$PWD ./install`, or `cwf-sync` for the user-root refresh.
+- Stage 1 code changes go to `cwf-implementer`, one-shot, then close the agent.
