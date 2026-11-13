@@ -27,12 +27,12 @@ AGENT_OUT = os.path.join(ROOT, "cwf", "agents")
 BIN_OUT = os.path.join(ROOT, "cwf", "bin")
 # Upstream scripts the shipped skills call by path. They are copied out of the
 # checksum-pinned tree and rewritten for Codex state paths, like the skills themselves.
-SKILL_BINS = ("wf-code-eval", "wf-map", "wf-census")
+SKILL_BINS = ("wf-code-eval", "wf-map", "wf-census", "wf-settings-apply")
 
 # Frontmatter keys the agentskills.io standard defines; everything else is dropped.
 KEEP_KEYS = {"name", "description", "license", "compatibility", "metadata"}
 SKILLS = ("blueprint", "code-evaluator", "records-code-map", "security-evaluator",
-          "shared-artifact", "text-eval", "timezone", "ui-design")
+          "shared-artifact", "text-eval", "ui-design")
 # Upstream handbooks that are workforce employees rather than skill-bundled advisors.
 WORKFORCE_AGENTS = ("content-classifier", "conversion-auditor", "doctrine-auditor",
                     "handbook-cold-reader", "headcount-skeptic", "provenance-analyst",
@@ -64,6 +64,10 @@ LOCAL_AGENT_SOURCES = {
 # skill. Copied verbatim into cwf/skills/, same shape as the generated ones.
 LOCAL_SKILLS = {
     "cwf-dev": os.path.join(ROOT, "cwf", "skills-src", "cwf-dev"),
+    # C0.7: upstream's timezone skill writes `env.TZ` into settings.json, which Codex does
+    # not read (measured 2026-11-13), so the Codex port is authored here against the
+    # mechanism Codex has: `shell_environment_policy.set.TZ` in the user config.toml.
+    "cwf-timezone": os.path.join(ROOT, "cwf", "skills-src", "cwf-timezone"),
 }
 
 AGENT_LANES = {
@@ -87,10 +91,6 @@ COMMON = [
      '|| WF="${CLAUDE_PROJECT_DIR}/.claude/skills/workforce"',
      'WF="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}"; '
      '[ -d "$WF" ] || WF="${CODEX_HOME:-$HOME/.codex}/codex-workforce"'),
-    ('TZB="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/timezone/bin/wf-timezone"; '
-     '[ -x "$TZB" ] || TZB="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/timezone/bin/wf-timezone"',
-     'TZB="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}/cwf-timezone/bin/wf-timezone"; '
-     '[ -x "$TZB" ] || TZB="${CODEX_HOME:-$HOME/.codex}/codex-workforce/cwf-timezone/bin/wf-timezone"'),
     ('TS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/text-eval/bin/wf-text-scan"; '
      '[ -x "$TS" ] || TS="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/skills/text-eval/bin/wf-text-scan"',
      'TS="${CWF_INSTALL_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/.codex/codex-workforce}/cwf-text-eval/bin/wf-text-scan"; '
@@ -134,7 +134,6 @@ COMMON = [
     ("Claude's", "Codex's"), ("Claude runs", "Codex runs"),
     ("${CLAUDE_CONFIG_DIR:-~/.claude}", "${CODEX_HOME:-~/.codex}"),
     ("${CLAUDE_CONFIG_DIR:-$HOME/.claude}", "${CODEX_HOME:-$HOME/.codex}"),
-    ('/home/you/.claude/skills/timezone', '<CODEX_HOME>/codex-workforce/cwf-timezone'),
     ('os.path.join(".claude", "skills", "text-eval", "CATALOG-ANCHOR.md")',
      'os.path.join(".agents", "skills", "cwf-text-eval", "CATALOG-ANCHOR.md")'),
     ('os.path.join(root, ".claude", name)', 'os.path.join(root, ".codex", name)'),
@@ -156,11 +155,6 @@ SCRIPT_REPLACEMENTS = {
          '.agents/skills/cwf-text-eval/CATALOG-ANCHOR.md'),
         ('os.path.join(".claude", "skills", "text-eval", "CATALOG-ANCHOR.md")',
          'os.path.join(".agents", "skills", "cwf-text-eval", "CATALOG-ANCHOR.md")'),
-    ],
-    "bin/wf-timezone": [
-        ("${CLAUDE_CONFIG_DIR:-~/.claude}", "${CODEX_HOME:-~/.codex}"),
-        ("$CLAUDE_PROJECT_DIR", "$CWF_PROJECT_DIR"),
-        ('os.path.join(root, ".claude", name)', 'os.path.join(root, ".codex", name)'),
     ],
 }
 # Standalone scripts in cwf/bin/, rewritten before they are installed.
@@ -189,9 +183,14 @@ BIN_REPLACEMENTS = {
          'os.environ.get("CWF_PROJECT_DIR") or os.getcwd()'),
         ("default `$CLAUDE_PROJECT_DIR`", "default `$CWF_PROJECT_DIR`"),
     ],
-    # wf-census is loaded by wf-code-eval to resolve hook commands. Only the paths that
-    # decide which hooks and agents exist need the Codex names; its other checks are not
-    # reachable from the shipped code-eval coordinate path.
+    # wf-settings-apply is imported by wf-code-eval (`refuse_write`, the CWE-59 check) as a
+    # sibling in cwf/bin/; without it the shipped code-eval stamp crashes. Retargeted from
+    # Claude's config root to Codex's.
+    "wf-settings-apply": [
+        ('os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")',
+         'os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")'),
+        ('${CLAUDE_CONFIG_DIR:-$HOME/.claude}', '${CODEX_HOME:-$HOME/.codex}'),
+    ],
     "wf-census": [
         ('os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")',
          'os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")'),
@@ -329,7 +328,7 @@ def build(name):
         for fn in files:
             path = os.path.join(dirpath, fn)
             rel = os.path.relpath(path, dest)
-            if fn in ("wf-text-scan", "wf-timezone"):
+            if fn == "wf-text-scan":
                 rel = "bin/" + fn
             elif rel != "SKILL.md" and not fn.endswith((".md", ".html", ".py", ".txt")):
                 continue

@@ -3,6 +3,42 @@
 The version lives in `VERSION`. Bump it in the same change that alters anything listed in
 `manifest.txt`, and add an entry here.
 
+## 0.1.13 (2026-11-13)
+
+- **Fixed the false-pass paths measured by the independent review.** `wait_agent` and
+  `close_agent` no longer count as outside evidence, so polling or closing an agent cannot
+  open "hearing" by itself. The upstream tagger's org-chart path is patched to
+  `.codex-workforce/org-chart.md`, its duplicate dispatch line is suppressed in favor of the
+  adapter's, and a truncated or invalid rollout is reported "not judged" instead of matching.
+- Directives now resolve Codex custom-agent handbooks at `.codex/agents/<name>.toml`; cap-hit
+  PERF records do the same; widen's work-segment check follows the Codex work root.
+- `cwf/bin/wf-settings-apply` is now generated and shipped (manifest row added), retargeted to
+  `${CODEX_HOME:-~/.codex}`.
+- The turn budget no longer reads a same-named `.claude/agents/<name>.md` `maxTurns`, nor
+  Claude's personal agent root, so Claude state cannot cap a Codex agent (path map M4).
+- **`RESUME.md` is injected once per session**, on the first main-session prompt, as
+  `AGENTS.md` already said. A marker in the session's scratch directory stops repeats.
+- **`cwf-timezone` now writes the key Codex reads.** Codex does not read `settings.json`
+  (measured: `env.TZ` there left `$TZ` empty in `codex sandbox`). The skill is now authored in
+  `cwf/skills-src/cwf-timezone/` and writes `shell_environment_policy.set.TZ` in the user
+  `config.toml` with a line-level edit; `set` then `clear` restores the file byte for byte, and
+  an inline table is refused with the line to add by hand. `bin/wf-timezone` is replaced by
+  `bin/cwf-timezone`. The installer now marks skill scripts executable, so the documented
+  resolver finds them. `cwf/bin/wf-settings-apply` stays: `wf-code-eval` imports it.
+- **Re-trust notice.** The prompt hook compares each codex-workforce entry in the project and
+  user `hooks.json` with its `trusted_hash` (format reproduced from Codex's own rows) and,
+  once per session, says which changed and need `/hooks`. `cwf-hook trust-check HOOKS_JSON`
+  prints the states and exits 1 when one is stale; `install` uses it for its final line.
+- **Install transaction.** `install` and `install.ps1` read the previous ownership records
+  before replacing the install directory, so a skill or agent the new manifest dropped is
+  pruned instead of orphaned. A same-named agent the installer never placed, and that differs
+  from ours, is kept, not recorded, and so never deleted by update or uninstall.
+- Tests: regressions for wait/close-only hearing and truncated rollouts through the real hook
+  (from `.codex-workforce/audit/probe_close.py` and `probe_trunc.py`), a Claude chart being
+  invisible, the turn-budget read, first-prompt resume, a populated live `SubagentStop`
+  fixture in `tests/fixtures/subagent-stop-0.167.1/`, hook trust, the timezone round trip, and
+  the install prune and foreign-agent cases. `install.ps1` is not exercised (no PowerShell).
+
 ## 0.1.12 (2026-11-13)
 
 - **Fixed a second pruning defect in `cwf-sync`, found by a peer read rather than by me.**

@@ -3,6 +3,7 @@
 
     cwf-hook prompt     UserPromptSubmit and SubagentStart -> wf-task-tag
     cwf-hook stop       Stop and SubagentStop -> wf-turn-ledger, wf-widen, then the juror
+    cwf-hook trust-check HOOKS_JSON   which cwf hooks Codex will skip until re-trusted
 
 Codex launches matching hooks for one event concurrently, so the Stop steps that Claude
 Code runs in settings order are run here in that same order, in one hook.
@@ -37,6 +38,13 @@ def prompt_event(raw):
         if out is None:
             out = {}
         out["systemMessage"] = _join(out.get("systemMessage"), f"cwf: {problem}")
+    notice = payload.get("cwf_retrust_notice") or ""
+    if notice:
+        # C0.8: a systemMessage is the channel the user sees; it is not model context.
+        if out is None:
+            out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                          "additionalContext": text}}
+        out["systemMessage"] = _join(out.get("systemMessage"), notice)
     if out is not None:
         resume = payload.get("cwf_resume_context") or ""
         dispatch = payload.get("cwf_dispatch_context") or ""
@@ -152,9 +160,23 @@ def emit_block(reason, system):
     return 0
 
 
+def trust_check(hooks_path):
+    """C0.8: print each codex-workforce hook's trust state; exit 1 when one needs /hooks."""
+    rows = cwf_codex.hook_trust_status(hooks_path)
+    for key, state in rows:
+        print(f"{state:8} {key}")
+    stale = [k for k, st in rows if st in ("changed", "new")]
+    if stale:
+        print(f"re-trust needed: {len(stale)} hook(s) will not run until trusted in /hooks")
+        return 1
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "trust-check":
+        return trust_check(sys.argv[2])
     if len(sys.argv) != 2 or sys.argv[1] not in ("prompt", "stop"):
-        print("usage: cwf-hook {prompt|stop}", file=sys.stderr)
+        print("usage: cwf-hook {prompt|stop|trust-check HOOKS_JSON}", file=sys.stderr)
         return 2
     try:
         raw = json.loads(sys.stdin.read() or "{}")

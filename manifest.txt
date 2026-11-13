@@ -31,6 +31,7 @@ cwf/model-catalog.json
 cwf/bin/wf-code-eval
 cwf/bin/wf-map
 cwf/bin/wf-census
+cwf/bin/wf-settings-apply
 cwf/lib/cwf_codex.py
 cwf/lib/cwf_juror.py
 upstream/claude-workforce/UPSTREAM.md
@@ -70,7 +71,7 @@ cwf/skills/cwf-text-eval/references/human-markers.md
 cwf/skills/cwf-text-eval/references/text-tells.md
 cwf/skills/cwf-text-eval/references/version.md
 cwf/skills/cwf-timezone/SKILL.md
-cwf/skills/cwf-timezone/bin/wf-timezone
+cwf/skills/cwf-timezone/bin/cwf-timezone
 cwf/skills/cwf-ui-design/SKILL.md
 cwf/skills/cwf-ui-design/references/design-quality-catalog.md
 cwf/skills/cwf-ui-design/references/direction.md

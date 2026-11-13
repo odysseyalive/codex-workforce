@@ -93,10 +93,13 @@ TOOL_MAP = {
     "web_search_call": "WebSearch",
     "web_fetch": "WebFetch",
     "spawn_agent": "Agent",
-    "wait_agent": "Agent",
-    "close_agent": "Agent",
-    # A poll carries no new evidence: the exec_command that opened the session was
-    # already counted. It is mapped to the same read counter so it is never unknown.
+    # Lifecycle calls carry no new evidence: the spawn that opened the agent was
+    # counted when it happened. Mapping wait/close to Agent would let a poll open
+    # "outside" hearing without anything outside being read (review finding 1).
+    "wait_agent": "Read",
+    "close_agent": "Read",
+    # A poll of an exec_command session carries no new evidence either; the command
+    # that opened it was already counted.
     "write_stdin": "Read",
     "view_image": "Read",
 }
@@ -329,7 +332,11 @@ def convert_until_reply(src, dst, reply, sidechain=False, tries=8, wait=0.25):
     happen at conversion. Returns (path or None, matched)."""
     import time
     path = convert_rollout(src, dst, sidechain)
-    if not reply or path is None:
+    if path is None:
+        # A truncated or otherwise unreadable rollout is never "matched". The caller
+        # must report the stop as not judged rather than treating None as clean.
+        return None, False
+    if not reply:
         return path, True
     for _ in range(tries):
         if _norm(last_reply(path)) == _norm(reply):
@@ -339,17 +346,26 @@ def convert_until_reply(src, dst, reply, sidechain=False, tries=8, wait=0.25):
     return path, _norm(last_reply(path)) == _norm(reply)
 
 
-def resume_context(root, payload):
+RESUME_MARKER = "cwf-resume-injected"
+
+
+def resume_context(root, payload, scratch=None):
     """The tracked `RESUME.md` a new session should pick up, or "".
 
     Only a main-session UserPromptSubmit receives it: a subagent has neither the user's
     conversation nor a reason to inherit the parent's handoff. A Stop continuation is a
     replayed prompt with the feedback prefix, so it must not re-inject the file. The file is
     tracked, size-capped, and read as text; nothing in it is executed.
+
+    FIRST PROMPT ONLY (C0.6, review finding 4): once injected, a marker in the session's
+    own scratch directory stops every later prompt of that session from repeating it.
     """
     if payload.get("hook_event_name") != "UserPromptSubmit":
         return ""
     if str(payload.get("prompt") or "").startswith(FEEDBACK_PREFIX):
+        return ""
+    marker = os.path.join(scratch, RESUME_MARKER) if scratch else None
+    if marker and os.path.lexists(marker):
         return ""
     path = os.path.join(root, RESUME_FILE)
     try:
@@ -363,6 +379,12 @@ def resume_context(root, payload):
         return ""
     if len(text) > RESUME_LIMIT:
         text = text[:RESUME_LIMIT] + "\n[resume file truncated]\n"
+    if marker:
+        try:
+            with open(marker, "x", encoding="utf-8") as fh:
+                fh.write(RESUME_FILE + "\n")
+        except OSError:
+            return ""   # another prompt of this session got there first, or no state dir
     return ("Project resume context (tracked, read as context; delete or replace it when the "
             "handoff is finished):\n\n" + text)
 
@@ -415,6 +437,108 @@ def dispatch_context(root):
     return line
 
 
+# ── hook trust (C0.8) ───────────────────────────────────────────────────
+# Codex skips a hook whose definition changed since it was trusted in `/hooks`, silently.
+# The stored `trusted_hash` was reproduced on codex-cli 0.169.0 (2026-11-13, 8 of 8 live
+# cwf rows plus one foreign row): sha256 of the compact, key-sorted JSON of {"event_name": <snake_case event>,
+# "hooks": [<handler with async defaulted to false>]} plus "matcher" when the group has
+# one. The format is Codex's, not documented, so an unreadable config reports "unknown",
+# never "trusted".
+def _snake(event):
+    return "".join("_" + c.lower() if c.isupper() and i else c.lower()
+                   for i, c in enumerate(event))
+
+
+def hook_trust_hash(event, group, handler):
+    import hashlib
+    h = dict(handler)
+    h.setdefault("async", False)
+    if os.name != "nt":
+        # Measured: the user-scope rows carry commandWindows and still match, and Codex
+        # runs them, so off Windows the field is not part of the hashed definition.
+        h.pop("commandWindows", None)
+    obj = {"event_name": _snake(event), "hooks": [h]}
+    if "matcher" in group:
+        obj["matcher"] = group["matcher"]
+    text = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _trusted_hashes(config_path):
+    try:
+        with open(config_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    try:
+        import tomllib
+        state = (tomllib.loads(raw.decode("utf-8")).get("hooks") or {}).get("state") or {}
+        return {k: v.get("trusted_hash") for k, v in state.items() if isinstance(v, dict)}
+    except ImportError:
+        import re
+        return dict(re.findall(r'\[hooks\.state\."([^"]+)"\]\s*\ntrusted_hash\s*=\s*"([^"]+)"',
+                               raw.decode("utf-8", "replace")))
+    except ValueError:
+        return None
+
+
+def hook_trust_status(hooks_path, config_path=None):
+    """[(key, "trusted" | "changed" | "new" | "unknown")] for every cwf-hook handler in
+    `hooks_path`. "changed" and "new" are entries Codex will skip until re-trusted."""
+    config_path = config_path or os.path.join(
+        os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex"),
+        "config.toml")
+    try:
+        with open(hooks_path, encoding="utf-8") as fh:
+            hooks = (json.load(fh) or {}).get("hooks") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    trusted = _trusted_hashes(config_path)
+    path = os.path.abspath(hooks_path)
+    out = []
+    for event, groups in hooks.items():
+        for gi, group in enumerate(groups if isinstance(groups, list) else []):
+            for hi, handler in enumerate(group.get("hooks") or []):
+                if "cwf-hook" not in str(handler.get("command", "")):
+                    continue
+                key = f"{path}:{_snake(event)}:{gi}:{hi}"
+                if trusted is None:
+                    state = "unknown"
+                elif key not in trusted:
+                    state = "new"
+                elif trusted[key] == hook_trust_hash(event, group, handler):
+                    state = "trusted"
+                else:
+                    state = "changed"
+                out.append((key, state))
+    return out
+
+
+def retrust_notice(root, scratch=None):
+    """One line telling the user to re-trust, or "". Shown once per session (a marker in
+    the session's scratch directory), and only for cwf entries that changed or are new.
+    A changed prompt hook cannot say this itself, because Codex no longer runs it; the
+    entries that still run say it for the ones that do not."""
+    stale = []
+    for hooks_path in (os.path.join(root, ".codex", "hooks.json"),
+                       os.path.join(os.environ.get("CODEX_HOME")
+                                    or os.path.join(os.path.expanduser("~"), ".codex"),
+                                    "hooks.json")):
+        stale += [k for k, st in hook_trust_status(hooks_path) if st in ("changed", "new")]
+    if not stale:
+        return ""
+    marker = os.path.join(scratch, "cwf-retrust-noticed") if scratch else None
+    if marker:
+        try:
+            with open(marker, "x", encoding="utf-8") as fh:
+                fh.write("\n".join(stale) + "\n")
+        except OSError:
+            return ""
+    return ("cwf: %d codex-workforce hook(s) changed since you trusted them and will not run "
+            "until re-trusted: open /hooks and trust them (%s)"
+            % (len(stale), ", ".join(k.rsplit(":", 3)[-3] for k in stale)))
+
+
 def normalize_payload(payload):
     """Codex hook input -> the payload the upstream hooks expect. Returns (payload, env).
     Sets `cwf_reply_unmatched` when a Stop's reply never appeared in the transcript, and
@@ -425,9 +549,11 @@ def normalize_payload(payload):
     sid = _safe(p.get("session_id"))
     scratch = state_dir(root, "scratch", sid)
     p["scratchpad_dir"] = scratch
-    p["cwf_resume_context"] = resume_context(root, p)
+    p["cwf_resume_context"] = resume_context(root, p, scratch)
     p["cwf_dispatch_context"] = (dispatch_context(root)
                                  if p.get("hook_event_name") == "UserPromptSubmit" else "")
+    p["cwf_retrust_notice"] = (retrust_notice(root, scratch)
+                               if p.get("hook_event_name") == "UserPromptSubmit" else "")
     p["cwf_rollout_path"] = p.get("transcript_path")
     stopping = str(p.get("hook_event_name", "")).endswith("Stop")
     if stopping:
@@ -450,7 +576,11 @@ def normalize_payload(payload):
         mine = side == (p.get("hook_event_name") == "SubagentStop")
         if stopping and mine:
             path, matched = convert_until_reply(src, dst, p.get("last_assistant_message"), side)
-            if not matched:
+            if path is None:
+                p["cwf_unjudged"] = ("the rollout transcript could not be read whole "
+                                     "(truncated or invalid line); this stop has no "
+                                     "transcript to judge")
+            elif not matched:
                 p["cwf_reply_unmatched"] = True
         else:
             path = convert_rollout(src, dst, side)
@@ -543,6 +673,47 @@ def _patch(module):
             module.perf_store = lambda root, _m=module: _perf_store(_m, root)
     if hasattr(module, "WORK_DIRS"):
         module.WORK_DIRS = (STATE_DIRNAME, "work")
+    # C0.5/M1: upstream's tagger still reads Claude's chart. Patch the live constant
+    # and suppress its own dispatch line: cwf-hook already injects the Codex dispatch
+    # line, so leaving both produced contradictory org/no-org context.
+    if hasattr(module, "ORG_CHART"):
+        module.ORG_CHART = ORG_CHART_REL
+        module.ORG_MARKER = ORG_MARKER
+        module.dispatch_line = lambda _payload, _issue_id: ""
+    # C0.5/M4: the turn budget must never read a Claude handbook's `maxTurns`, nor
+    # Claude's personal agent root. Codex custom agents have no turn-cap field, so a Codex
+    # agent has no cap here; a same-named `.claude/agents/<name>.md` cannot steer it.
+    if hasattr(module, "read_cap") and hasattr(module, "MAX_TURNS_RX"):
+        module.config_root = lambda: os.environ.get("CODEX_HOME") or os.path.join(
+            os.path.expanduser("~"), ".codex")
+        module.read_cap = lambda _root, _agent_type: None
+    # C0.5/M3: directives belong to a Codex custom agent, not a Claude markdown one.
+    if hasattr(module, "handbook_path") and hasattr(module, "bare_name"):
+        def _codex_handbook_path(root, payload, _m=module):
+            at = str(payload.get("agent_type") or "").strip()
+            if not _m.bare_name(at):
+                return None
+            path = os.path.join(root, ".codex", "agents", at + ".toml")
+            return path if _m._inside(root, path) else None
+        module.handbook_path = _codex_handbook_path
+    # C0.5/M7: widen's work-segment check must follow the Codex work root, not match
+    # Claude's path by coincidence.
+    if hasattr(module, "OUTPUT_WORK_SEG"):
+        module.OUTPUT_WORK_SEG = os.path.join(STATE_DIRNAME, "work") + os.sep
+    if hasattr(module, "NO_BRIEF"):
+        module.NO_BRIEF = ("No readable HANDOFF.md under .codex-workforce/work/<run-id>/{who}/, "
+                           "so section 1 cannot be quoted.")
+    # C0.5/M4: cap PERF records the handbook that actually governed the Codex agent.
+    # Rebuild just this function from upstream source with the two path literals moved;
+    # upstream on disk remains checksum-pinned.
+    if hasattr(module, "cap_perf"):
+        import inspect
+        src = inspect.getsource(module.cap_perf)
+        src = src.replace('os.path.join(".claude", "agents", f"{agent}.md")',
+                         'os.path.join(".codex", "agents", f"{agent}.toml")')
+        ns = dict(module.__dict__)
+        exec(compile(src, getattr(module, "__file__", "wf-widen"), "exec"), ns)
+        module.cap_perf = ns["cap_perf"]
     # F08/F25: the injected wording names Claude-only tools. Patch the live constants so
     # every load, including a sibling's own copy, speaks the Codex surface.
     if hasattr(module, "USER_WORDS"):

@@ -1,0 +1,14 @@
+{
+ "session_id": "01a1cb72-d430-7df2-88ab-f930283804ba",
+ "turn_id": "01a1cb72-df0b-74e0-a58e-ae307b9062dc",
+ "transcript_path": "parent.jsonl",
+ "agent_transcript_path": "agent.jsonl",
+ "cwd": "<project>",
+ "hook_event_name": "SubagentStop",
+ "model": "deepseek/deepseek-v4.1-flash-1017",
+ "permission_mode": "bypassPermissions",
+ "stop_hook_active": false,
+ "agent_id": "01a1cb72-df07-7cd0-9e93-2b6774490b6a",
+ "agent_type": "default",
+ "last_assistant_message": "SUBAGENT_PROBE_DONE2"
+}

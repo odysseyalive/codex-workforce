@@ -131,26 +131,31 @@ a, b = ([int(x) for x in v.split(".")] for v in sys.argv[1:3])
 sys.exit(0 if a < b else 1)' "$1" "$2" 2>/dev/null
 }
 
+# ── owned-path removal, shared by uninstall and the update prune ────────────
+# A name must be a single plain component: a tampered list could otherwise name ../ paths
+# and turn this into a recursive delete outside the skills or agents folder.
+remove_skill() {
+  if printf '%s' "$1" | grep -Eq '^cwf-[A-Za-z0-9._-]+$' && [ "${1#*..}" = "$1" ] \
+     && [ ! -L "$SKILLS_DIR/$1" ]; then
+    rm -rf "${SKILLS_DIR:?}/$1"
+  fi
+}
+remove_agent() {
+  if printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]+\.toml$' && [ "${1#*..}" = "$1" ] \
+     && [ ! -L "$CONF_DIR/agents/$1" ]; then
+    rm -f "${CONF_DIR:?}/agents/$1"
+  fi
+}
+listed() { [ -f "$2" ] && grep -Fxq -- "$1" "$2"; }
+
 # ── uninstall ────────────────────────────────────────────────────────────────
 if [ "$ACTION" = uninstall ]; then
-  # Only the skills this installer put there, as recorded at install time.
+  # Only the skills and agents this installer put there, as recorded at install time.
   if [ -f "$INSTALL_DIR/installed-skills.txt" ]; then
-    # A name must be a single plain cwf-* component: a tampered list could otherwise
-    # name ../ paths and turn this into a recursive delete outside the skills folder.
-    while IFS= read -r name; do
-      if printf '%s' "$name" | grep -Eq '^cwf-[A-Za-z0-9._-]+$' && [ "${name#*..}" = "$name" ] \
-         && [ ! -L "$SKILLS_DIR/$name" ]; then
-        rm -rf "${SKILLS_DIR:?}/$name"
-      fi
-    done < "$INSTALL_DIR/installed-skills.txt"
+    while IFS= read -r name; do remove_skill "$name"; done < "$INSTALL_DIR/installed-skills.txt"
   fi
   if [ -f "$INSTALL_DIR/installed-agents.txt" ]; then
-    while IFS= read -r name; do
-      if printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]+\.toml$' && [ "${name#*..}" = "$name" ] \
-         && [ ! -L "$CONF_DIR/agents/$name" ]; then
-        rm -f "${CONF_DIR:?}/agents/$name"
-      fi
-    done < "$INSTALL_DIR/installed-agents.txt"
+    while IFS= read -r name; do remove_agent "$name"; done < "$INSTALL_DIR/installed-agents.txt"
   fi
   rm -rf "$INSTALL_DIR"
   [ -f "$HOOKS_JSON" ] && edit_hooks remove
@@ -180,6 +185,15 @@ while IFS= read -r path || [ -n "$path" ]; do
 done < "$STAGE/manifest.txt"
 
 # ── install ──────────────────────────────────────────────────────────────────
+# READ THE OLD OWNERSHIP RECORDS BEFORE ANYTHING IS REPLACED (C0.9, review finding 7). The
+# install dir is replaced whole below, and the records live inside it; read afterwards, they
+# describe the NEW install, so a skill or agent the new manifest dropped would be orphaned
+# and keep loading forever.
+PRIOR_SKILLS="$STAGE/prior-skills.txt"; PRIOR_AGENTS="$STAGE/prior-agents.txt"
+: > "$PRIOR_SKILLS"; : > "$PRIOR_AGENTS"
+[ -f "$INSTALL_DIR/installed-skills.txt" ] && cp "$INSTALL_DIR/installed-skills.txt" "$PRIOR_SKILLS"
+[ -f "$INSTALL_DIR/installed-agents.txt" ] && cp "$INSTALL_DIR/installed-agents.txt" "$PRIOR_AGENTS"
+
 # Replace the install directory whole, so a file dropped from the manifest disappears.
 # cwf/skills is not install-dir content: it is the visible SOURCE for <skills-root>/<name>/,
 # and it is copied there below. Everything else under cwf/ ships into the install dir.
@@ -200,22 +214,47 @@ if [ -d "$STAGE/files/cwf/skills" ]; then
     name="$(basename "$skill")"
     rm -rf "${SKILLS_DIR:?}/$name"
     cp -R "$skill" "$SKILLS_DIR/$name"
+    # The fetch drops file modes; a skill's documented resolver tests `[ -x ]` (C0.7).
+    chmod +x "$SKILLS_DIR/$name"/bin/* 2>/dev/null || true
     echo "$name" >> "$INSTALL_DIR/installed-skills.txt"
   done
 fi
 # Custom agents are not skills: Codex discovers them only in .codex/agents/. Copy them
 # into .codex/agents beside the hooks; they are not skills and must not be listed for
 # skill uninstall.
+#
+# A SAME-NAMED AGENT THIS INSTALLER NEVER PLACED IS NOT OURS. Agent names carry no cwf-
+# prefix on disk, so a user's own `content-classifier.toml` is possible. It is overwritten
+# only when a previous install recorded placing it, or it is byte-identical to ours;
+# otherwise it is left alone, not recorded, and so never deleted by an uninstall.
 : > "$INSTALL_DIR/installed-agents.txt"
 if [ -d "$STAGE/files/cwf/agents" ]; then
   mkdir -p "$CONF_DIR/agents"
   for agent in "$STAGE"/files/cwf/agents/*.toml; do
     [ -e "$agent" ] || continue
     name="$(basename "$agent")"
-    cp "$agent" "$CONF_DIR/agents/$name"
+    dest="$CONF_DIR/agents/$name"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      if [ -L "$dest" ] || { ! listed "$name" "$PRIOR_AGENTS" && ! cmp -s "$agent" "$dest"; }; then
+        say "kept your own $dest; the shipped $name was not installed over it"
+        continue
+      fi
+    fi
+    cp "$agent" "$dest"
     echo "$name" >> "$INSTALL_DIR/installed-agents.txt"
   done
 fi
+
+# Prune what the previous install placed and this one no longer ships.
+while IFS= read -r name; do
+  listed "$name" "$INSTALL_DIR/installed-skills.txt" || remove_skill "$name"
+done < "$PRIOR_SKILLS"
+while IFS= read -r name; do
+  if ! listed "$name" "$INSTALL_DIR/installed-agents.txt" \
+     && [ ! -e "$STAGE/files/cwf/agents/$name" ]; then
+    remove_agent "$name"
+  fi
+done < "$PRIOR_AGENTS"
 
 edit_hooks add
 
@@ -237,4 +276,11 @@ fi
 say "hooks added to $HOOKS_JSON; skills in $SKILLS_DIR"
 say "models: select the shipped OpenRouter set with: codex --profile openrouter"
 say "        export OPENROUTER_API_KEY=sk-or-... first; the installer never writes your key"
-say "next: start codex, open /hooks and trust the codex-workforce hooks. They don't run until you do."
+# C0.8: say whether Codex will actually run the hooks just written. Trust is per definition
+# hash, kept in the USER config.toml for both scopes, so a changed hook is skipped silently
+# until it is re-trusted in /hooks.
+if CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" "$PY" "$INSTALL_DIR/cwf/bin/cwf-hook" trust-check "$HOOKS_JSON" >/dev/null 2>&1; then
+  say "hooks: already trusted in Codex; nothing to re-trust"
+else
+  say "next: start codex, open /hooks and trust the codex-workforce hooks. They don't run until you do."
+fi

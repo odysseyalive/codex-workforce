@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""cwf-timezone — the time zone every command Codex runs sees, set in ONE config key.
+
+    cwf-timezone [--root DIR] show [--json]   the setting, this machine's zone, candidates
+    cwf-timezone set <Area/City>              write shell_environment_policy.set.TZ
+    cwf-timezone clear                        remove it again
+
+WHY THIS IS NOT THE UPSTREAM SCRIPT. claude-workforce's `wf-timezone` writes `env.TZ` into
+`settings.json`, which Claude Code copies onto its own process. Codex reads no such file.
+MEASURED on codex-cli 0.169.0, 2026-11-13: with `{"env":{"TZ":"Asia/Tokyo"}}` in
+`$CODEX_HOME/settings.json`, `codex sandbox -- sh -c 'echo $TZ'` printed `TZ=[]`; with
+`-c shell_environment_policy.set.TZ="Europe/Berlin"` it printed `TZ=[Europe/Berlin]`. So the
+Codex mechanism is `[shell_environment_policy.set] TZ = "<zone>"` in the USER config.toml,
+which reaches every command Codex runs, in every project.
+
+WHAT IT DOES NOT CHANGE. Codex's own clock in its interface comes from the TZ of the shell
+that started Codex, not from this key. To move that too, export TZ in the shell profile.
+
+THE EDIT IS LINE-LEVEL. config.toml is the user's own file, so it is never loaded and
+dumped: `set` replaces or inserts one line and `clear` removes it. Every edit is re-parsed
+and must equal the intended config before anything is written; a file whose
+`shell_environment_policy.set` is written inline is refused, with the line to add by hand.
+A table this script created carries a trailing marker comment, so `clear` removes it again
+and gives back the file as it was before `set`.
+"""
+import argparse
+import copy
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+import time
+
+MARKER = "# added by cwf-timezone"
+HEADER = re.compile(r"^\s*\[\s*shell_environment_policy\s*\.\s*set\s*\]\s*(#.*)?$")
+ANY_HEADER = re.compile(r"^\s*\[")
+TZ_LINE = re.compile(r"^\s*(TZ|\"TZ\"|'TZ')\s*=")
+NAME_SHAPE = re.compile(r"^[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)*$")
+NOT_ZONES = {"posixrules", "localtime", "Factory", "leapseconds", "posix", "right"}
+
+
+def config_path():
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(home, "config.toml")
+
+
+def toml():
+    try:
+        import tomllib
+        return tomllib
+    except ImportError:
+        return None
+
+
+def is_zone(name):
+    if not name or not NAME_SHAPE.match(name) or name.split("/")[0] in NOT_ZONES:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def clock(name):
+    try:
+        import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo(name)).strftime("%-I:%M %p %Z")
+    except Exception:
+        return None
+
+
+def system_zone():
+    """This machine's own zone from its configuration, never from $TZ."""
+    try:
+        target = os.readlink("/etc/localtime")
+        if "zoneinfo/" in target and is_zone(target.split("zoneinfo/", 1)[1]):
+            return target.split("zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    try:
+        with open("/etc/timezone", encoding="utf-8") as fh:
+            name = fh.read().strip()
+        return name if is_zone(name) else None
+    except OSError:
+        return None
+
+
+def read(path):
+    """`(data, text, error)`. An absent file is `({}, "", None)`."""
+    if not os.path.lexists(path):
+        return {}, "", None
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, None, "%s cannot be read (%s)" % (path, exc)
+    try:
+        return toml().loads(text), text, None
+    except ValueError as exc:
+        return None, text, "%s is not valid TOML (%s); nothing was written" % (path, exc)
+
+
+def current_tz(data):
+    sep = (data or {}).get("shell_environment_policy")
+    st = sep.get("set") if isinstance(sep, dict) else None
+    tz = st.get("TZ") if isinstance(st, dict) else None
+    return tz if isinstance(tz, str) else None
+
+
+def _table(lines):
+    """(header index, end index) of the `[shell_environment_policy.set]` table, or None."""
+    for i, line in enumerate(lines):
+        if HEADER.match(line):
+            j = i + 1
+            while j < len(lines) and not ANY_HEADER.match(lines[j]):
+                j += 1
+            return i, j
+    return None
+
+
+def _nl(text):
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def with_tz(text, zone):
+    nl = _nl(text)
+    lines = text.splitlines(keepends=True)
+    entry = "TZ = %s%s" % (json.dumps(zone), nl)
+    span = _table(lines)
+    if span:
+        i, j = span
+        for k in range(i + 1, j):
+            if TZ_LINE.match(lines[k]):
+                lines[k] = entry
+                return "".join(lines)
+        lines.insert(i + 1, entry)
+        return "".join(lines)
+    lead = "" if not text else (nl if text.endswith(("\n", "\r")) else nl + nl)
+    return text + lead + "[shell_environment_policy.set]  " + MARKER + nl + entry
+
+
+def without_tz(text):
+    lines = text.splitlines(keepends=True)
+    span = _table(lines)
+    if not span:
+        return text
+    i, j = span
+    lines = [l for k, l in enumerate(lines) if not (i < k < j and TZ_LINE.match(l))]
+    span = _table(lines)
+    i, j = span
+    body = lines[i + 1:j]
+    if MARKER in lines[i] and all(not l.strip() for l in body):
+        start = i - 1 if i > 0 and not lines[i - 1].strip() else i
+        lines = lines[:start] + lines[j:]
+    return "".join(lines)
+
+
+def expected(data, zone):
+    want = copy.deepcopy(data)
+    if zone is None:
+        st = (want.get("shell_environment_policy") or {}).get("set")
+        if isinstance(st, dict):
+            st.pop("TZ", None)
+    else:
+        want.setdefault("shell_environment_policy", {}).setdefault("set", {})["TZ"] = zone
+    return want
+
+
+def _prune_empty(d):
+    """`clear` may remove a table it created; compare without empty tables either way."""
+    if isinstance(d, dict):
+        return {k: _prune_empty(v) for k, v in d.items() if not (isinstance(v, dict) and not _prune_empty(v))}
+    return d
+
+
+def write(path, new, before):
+    """Atomic replace of the REAL file (a linked config stays a link), refused when the file
+    changed since it was read."""
+    real = os.path.realpath(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    if os.path.exists(real):
+        with open(real, encoding="utf-8", newline="") as fh:
+            if fh.read() != before:
+                raise RuntimeError("%s changed while it was being edited; left alone" % real)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".cwf-timezone-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(new)
+        if os.path.exists(real):
+            os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def project_override(root):
+    path = os.path.join(root, ".codex", "config.toml")
+    if os.path.realpath(path) == os.path.realpath(config_path()):
+        return None
+    data, _t, _e = read(path)
+    tz = current_tz(data)
+    return {"path": path, "value": tz} if tz is not None else None
+
+
+def command(action, zone=None):
+    exe = shlex.quote(os.path.abspath(__file__))
+    return "%s %s%s" % (exe, action, " " + zone if zone else "")
+
+
+def do_show(root, as_json):
+    path = config_path()
+    data, _text, err = read(path)
+    pref = current_tz(data) if data is not None else None
+    sysz = system_zone()
+    cands = []
+    for zone, note in ((pref, "your current setting"), (sysz, "this machine's clock"),
+                       ("UTC", "Coordinated Universal Time"),
+                       ("America/New_York", "a common choice, not a guess about you")):
+        if zone and zone not in [c["zone"] for c in cands] and len(cands) < 4:
+            cands.append({"zone": zone, "note": note, "now": clock(zone),
+                          "current": zone == pref, "recommended": False})
+    if not pref and cands:
+        cands[0]["recommended"] = True
+    out = {"config": path, "config_error": err, "preference": pref, "system": sysz,
+           "overridden_by": [o for o in [project_override(root)] if o],
+           "candidates": cands, "set_command": command("set"), "clear_command": command("clear"),
+           "reaches": "every command Codex runs, in every project, from the next Codex start",
+           "does_not_reach": "Codex's own interface clock, which follows the TZ of the shell "
+                             "that started Codex"}
+    if as_json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print("TIME ZONE  %s   <- user scope: every project on this machine" % path)
+    if err:
+        print("  ! %s" % err)
+    print("  your setting   %s" % (("%s   now %s" % (pref, clock(pref) or "unknown")) if pref
+                                   else "none — commands Codex runs use this machine's clock"))
+    print("  this machine   %s" % (sysz or "unknown"))
+    for o in out["overridden_by"]:
+        print("  ! %s sets TZ=%s for that project, and it wins there" % (o["path"], json.dumps(o["value"])))
+    print("\n  candidates:")
+    for i, c in enumerate(cands, 1):
+        tag = " (current)" if c["current"] else " (recommended)" if c["recommended"] else ""
+        print("    %d. %s%s — %s — now %s" % (i, c["zone"], tag, c["note"], c["now"] or "unknown"))
+    print("\n  set one:   %s <Area/City>\n  remove it: %s" % (out["set_command"], out["clear_command"]))
+    return 0
+
+
+def edit(zone):
+    path = config_path()
+    data, text, err = read(path)
+    if err:
+        print("cwf-timezone: %s" % err, file=sys.stderr)
+        return 1
+    old = current_tz(data)
+    print("TIME ZONE  %s   <- user scope: every project on this machine" % path)
+    if old == zone:
+        print("  . TZ is already %s — nothing to change" % json.dumps(zone))
+        return 0
+    new = with_tz(text, zone) if zone else without_tz(text)
+    try:
+        ok = _prune_empty(toml().loads(new)) == _prune_empty(expected(data, zone))
+    except ValueError:
+        ok = False
+    if not ok:
+        line = "[shell_environment_policy.set] TZ = %s" % json.dumps(zone) if zone else "remove TZ"
+        print("cwf-timezone: %s defines shell_environment_policy.set in a form this line-level "
+              "edit cannot change safely; nothing was written. Edit it by hand: %s"
+              % (path, line), file=sys.stderr)
+        return 1
+    try:
+        write(path, new, text)
+    except (OSError, RuntimeError) as exc:
+        print("cwf-timezone: could not write %s (%s); nothing was changed." % (path, exc),
+              file=sys.stderr)
+        print("  run it yourself in Codex:  ! %s" % command("set" if zone else "clear", zone),
+              file=sys.stderr)
+        return 1
+    back, _t, err = read(path)
+    if err or current_tz(back) != zone:
+        print("cwf-timezone: re-read of %s did not show the change" % path, file=sys.stderr)
+        return 1
+    if zone:
+        print("  + shell_environment_policy.set.TZ = %s   (was %s)"
+              % (json.dumps(zone), json.dumps(old) if old else "not set"))
+        print("  verified on disk: TZ = %s" % json.dumps(current_tz(back)))
+        print("  now %s in %s" % (clock(zone), zone))
+    else:
+        print("  - shell_environment_policy.set.TZ removed   (was %s)" % json.dumps(old))
+        print("  verified on disk: TZ absent")
+    print("  Commands Codex runs follow it from the next Codex start. Codex's own interface "
+          "clock follows the TZ of the shell that started Codex.")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--root", default=os.environ.get("CWF_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("action", choices=("show", "set", "clear"))
+    ap.add_argument("zone", nargs="?")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    if toml() is None:
+        print("cwf-timezone: needs Python 3.11+ (tomllib) to verify an edit to config.toml",
+              file=sys.stderr)
+        return 1
+    if args.action == "set":
+        zone = (args.zone or "").strip()
+        if not is_zone(zone):
+            print("cwf-timezone: \"%s\" is not a time zone this machine knows. Use a name like "
+                  "America/New_York. Nothing was written." % zone, file=sys.stderr)
+            return 2
+        return edit(zone)
+    if args.zone:
+        print("cwf-timezone: %s takes no zone" % args.action, file=sys.stderr)
+        return 2
+    if args.action == "clear":
+        return edit(None)
+    return do_show(os.path.abspath(args.root), args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

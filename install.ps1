@@ -194,6 +194,15 @@ try {
     }
 
     # ── install ──────────────────────────────────────────────────────────────
+    # Read the old ownership records BEFORE the install dir is replaced (C0.9): they live
+    # inside it, and read afterwards they describe the new install, orphaning anything the
+    # new manifest dropped.
+    $priorSkills = @(); $priorAgents = @()
+    $oldSkillList = Join-Path $InstallDir "installed-skills.txt"
+    $oldAgentList = Join-Path $InstallDir "installed-agents.txt"
+    if (Test-Path $oldSkillList) { $priorSkills = @(Get-Content $oldSkillList) }
+    if (Test-Path $oldAgentList) { $priorAgents = @(Get-Content $oldAgentList) }
+
     # Replace the install directory whole, so a file dropped from the manifest disappears.
     $New = "$InstallDir.cwf-new"
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $New
@@ -206,14 +215,7 @@ try {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
     Move-Item $New $InstallDir
 
-    # The installer directory is a whole replacement, so agents arrive inside it. Capture
-    # their names from this staged copy before pruning or moving anything.
     $srcAgents = Join-Path $files "cwf\agents"
-    $installedAgents = @()
-    if (Test-Path $srcAgents) {
-        $installedAgents = @(Get-ChildItem -File $srcAgents -Filter "*.toml" | ForEach-Object { $_.Name })
-    }
-
     $installed = @()
     $srcSkills = Join-Path $files "cwf\skills"
     if (Test-Path $srcSkills) {
@@ -225,16 +227,54 @@ try {
         }
     }
     Set-Content -Encoding utf8 (Join-Path $InstallDir "installed-skills.txt") $installed
-    # Custom agents are not skills: Codex discovers them only in .codex/agents/.
+    # Custom agents are not skills: Codex discovers them only in .codex/agents/. A
+    # same-named agent this installer never recorded placing, and that differs from ours,
+    # is the user's own: it is kept, not recorded, and so never deleted by an uninstall.
+    $installedAgents = @()
+    $agentDir = Join-Path $ConfDir "agents"
     if (Test-Path $srcAgents) {
-        $agentDir = Join-Path $ConfDir "agents"
         New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
         Get-ChildItem -File $srcAgents -Filter "*.toml" | ForEach-Object {
-            Copy-Item -Force $_.FullName (Join-Path $agentDir $_.Name)
+            $dest = Join-Path $agentDir $_.Name
+            $existing = Get-Item -Force -ErrorAction SilentlyContinue $dest
+            if ($existing) {
+                $isLink = [bool]($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)
+                $same = (-not $isLink) -and ((Get-FileHash $dest).Hash -eq (Get-FileHash $_.FullName).Hash)
+                if ($isLink -or (($priorAgents -notcontains $_.Name) -and -not $same)) {
+                    Say "kept your own $dest; the shipped $($_.Name) was not installed over it"
+                    return
+                }
+            }
+            Copy-Item -Force $_.FullName $dest
             $installedAgents += $_.Name
         }
     }
     Set-Content -Encoding utf8 (Join-Path $InstallDir "installed-agents.txt") $installedAgents
+
+    # Prune what the previous install placed and this one no longer ships.
+    $skillsFull = [IO.Path]::GetFullPath($SkillsDir)
+    foreach ($name in $priorSkills) {
+        if ($installed -contains $name) { continue }
+        if ($name -notmatch '^cwf-[A-Za-z0-9._-]+$' -or $name.Contains("..")) { continue }
+        $target = [IO.Path]::GetFullPath((Join-Path $skillsFull $name))
+        if ([IO.Path]::GetDirectoryName($target) -ne $skillsFull) { continue }
+        $item = Get-Item -Force -ErrorAction SilentlyContinue $target
+        if ($item -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Remove-Item -Recurse -Force $target
+        }
+    }
+    $agentsFull = [IO.Path]::GetFullPath($agentDir)
+    foreach ($name in $priorAgents) {
+        if ($installedAgents -contains $name) { continue }
+        if (Test-Path (Join-Path $srcAgents $name)) { continue }
+        if ($name -notmatch '^[A-Za-z0-9._-]+\.toml$' -or $name.Contains("..")) { continue }
+        $target = [IO.Path]::GetFullPath((Join-Path $agentsFull $name))
+        $item = Get-Item -Force -ErrorAction SilentlyContinue $target
+        if ($item -and [IO.Path]::GetDirectoryName($target) -eq $agentsFull -and
+            -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Remove-Item -Force $target
+        }
+    }
 
     Edit-Hooks "add"
 } finally {

@@ -194,6 +194,108 @@ class InstallerTests(unittest.TestCase):
         # The personal scope is untouched by a project install.
         self.assertEqual(len(self.cwf_handlers(self.hooks(self.codex))), 0)
 
+    def make_tree(self, extra_skill=None, extra_agent=None):
+        """A copy of this package's manifest tree, optionally shipping one more skill and
+        agent, so an update FROM it to ROOT has something to drop."""
+        tree = os.path.join(self.tmp, "tree")
+        rows = manifest()
+        for p in rows:
+            dst = os.path.join(tree, p)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(ROOT, p), dst)
+        shutil.copy2(os.path.join(ROOT, "manifest.txt"), os.path.join(tree, "manifest.txt"))
+        added = []
+        if extra_skill:
+            rel = f"cwf/skills/{extra_skill}/SKILL.md"
+            os.makedirs(os.path.join(tree, os.path.dirname(rel)))
+            with open(os.path.join(tree, rel), "w") as fh:
+                fh.write(f"---\nname: {extra_skill}\ndescription: dropped later\n---\n")
+            added.append(rel)
+        if extra_agent:
+            rel = f"cwf/agents/{extra_agent}"
+            with open(os.path.join(tree, rel), "w") as fh:
+                fh.write('name = "dropped-later"\n')
+            added.append(rel)
+        with open(os.path.join(tree, "manifest.txt"), "a") as fh:
+            fh.write("".join(r + "\n" for r in added))
+        return tree
+
+    def test_update_prunes_what_the_new_manifest_dropped(self):
+        """C0.9 (review finding 7): the install dir is replaced whole, so the old ownership
+        records must be read first. A skill and an agent the previous install placed, and
+        the new one no longer ships, are removed; a user's own cwf-* skill is not."""
+        tree = self.make_tree("cwf-dropped", "dropped-agent.toml")
+        old = dict(self.env, CWF_REPO_URL="file://" + tree)
+        self.assertEqual(self.run_install("--user", env=old).returncode, 0)
+        skill = os.path.join(self.home, ".agents", "skills", "cwf-dropped")
+        agent = os.path.join(self.codex, "agents", "dropped-agent.toml")
+        self.assertTrue(os.path.isfile(os.path.join(skill, "SKILL.md")))
+        self.assertTrue(os.path.isfile(agent))
+        mine = os.path.join(self.home, ".agents", "skills", "cwf-mine")
+        os.makedirs(mine)
+        r = self.run_install("--user")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(skill), "a dropped skill was orphaned")
+        self.assertFalse(os.path.exists(agent), "a dropped agent was orphaned")
+        self.assertTrue(os.path.isdir(mine), "an update removed a skill it never placed")
+        inst = os.path.join(self.codex, "codex-workforce")
+        with open(os.path.join(inst, "installed-skills.txt")) as fh:
+            self.assertNotIn("cwf-dropped", fh.read().split())
+        with open(os.path.join(inst, "installed-agents.txt")) as fh:
+            self.assertNotIn("dropped-agent.toml", fh.read().split())
+        self.assertFalse(os.path.exists(inst + ".cwf-new"))
+
+    def test_same_named_foreign_agent_is_preserved(self):
+        """C0.9: a user's own agent file with a shipped name is never overwritten, never
+        recorded as ours, and so never deleted by update or uninstall."""
+        os.makedirs(os.path.join(self.codex, "agents"))
+        foreign = os.path.join(self.codex, "agents", "content-classifier.toml")
+        with open(foreign, "w") as fh:
+            fh.write('name = "my-own-classifier"\n')
+        r = self.run_install("--user")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("kept your own", r.stdout)
+        with open(foreign) as fh:
+            self.assertEqual(fh.read(), 'name = "my-own-classifier"\n')
+        listed = os.path.join(self.codex, "codex-workforce", "installed-agents.txt")
+        with open(listed) as fh:
+            names = fh.read().split()
+        self.assertNotIn("content-classifier.toml", names)
+        self.assertIn("doctrine-auditor.toml", names)
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        with open(foreign) as fh:
+            self.assertEqual(fh.read(), 'name = "my-own-classifier"\n')
+        self.assertEqual(self.run_install("--user", "--uninstall").returncode, 0)
+        self.assertTrue(os.path.isfile(foreign), "uninstall deleted a foreign same-named agent")
+        self.assertFalse(os.path.exists(os.path.join(self.codex, "agents", "doctrine-auditor.toml")))
+
+    def test_an_agent_we_placed_is_updated_in_place(self):
+        """The foreign-agent guard must not freeze our own registrations on update."""
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        ours = os.path.join(self.codex, "agents", "content-classifier.toml")
+        with open(ours, "a") as fh:
+            fh.write("# stale\n")
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        with open(ours) as fh, open(os.path.join(ROOT, "cwf", "agents",
+                                                 "content-classifier.toml")) as src:
+            self.assertEqual(fh.read(), src.read())
+
+    def test_install_reports_hook_trust(self):
+        """C0.8: a fresh install's hooks are untrusted, and the installer says to trust them."""
+        r = self.run_install("--user")
+        self.assertIn("open /hooks and trust", r.stdout)
+
+    def test_installed_timezone_skill_is_reachable_and_runs(self):
+        """C0.7: the skill's documented resolver finds the installed script, and it runs."""
+        self.assertEqual(self.run_install("--user").returncode, 0)
+        with open(os.path.join(self.home, ".agents", "skills", "cwf-timezone", "SKILL.md")) as fh:
+            line = [l for l in fh.read().splitlines() if l.startswith('TZB="')][0]
+        r = subprocess.run(["bash", "-c", line + '; "$TZB" set Asia/Tokyo'],
+                           capture_output=True, text=True, env=self.env, cwd=self.home, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.codex, "config.toml")) as fh:
+            self.assertIn('TZ = "Asia/Tokyo"', fh.read())
+
     def test_project_scope_outside_git_fails_cleanly(self):
         outside = os.path.join(self.tmp, "nogit")
         os.makedirs(outside)
