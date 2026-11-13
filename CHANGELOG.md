@@ -3,6 +3,31 @@
 The version lives in `VERSION`. Bump it in the same change that alters anything listed in
 `manifest.txt`, and add an entry here.
 
+## 0.1.14 (2026-11-13)
+
+- **`cwf/bin/cwf-org register`: a project's employees become Codex custom agents** (tracker
+  `C1.1`). Each handbook (markdown with `name`/`description` frontmatter, the shape of upstream's
+  `AGENT.md`) is rendered to `<project>/.codex/agents/<name>.toml`. Its body goes into
+  `developer_instructions` byte for byte, after a host-limits paragraph, and `tools:` /
+  `disallowedTools:` are kept only as instruction text. It plans by default and `--execute`
+  writes. A batch is atomic or absent: one refusal writes nothing. It refuses a symlink anywhere
+  on the path, an unsafe or infrastructure name (`cwf-workforce`, `cwf-org`, `cwf-dev`), a
+  shipped agent's name, an existing agent it did not generate, and **any name a user-scope
+  agent already has**. User scope wins on Codex, so that project copy would never load, and the
+  user's file is reported and left untouched. Each write goes through a temp file and a rename,
+  then is read back and parsed. `cwf-org check` parses every project agent and flags shadowed,
+  symlinked or unparseable ones. Chart generation is `C1.2`, not part of this release.
+- `cwf/lib/cwf_agents.py` is the one TOML writer for custom agents. `scripts/build-skills` now
+  renders the shipped agents with it, and the ten committed TOMLs regenerate byte-identical.
+  It escapes backslashes, triple quotes, control characters and astral characters, and it
+  refuses any render that does not parse back to the same values.
+- `scripts/build-skills` strips trailing whitespace from the scripts it generates. One line in
+  upstream `wf-settings-apply` carried it, so a rebuild no longer drifts from the committed copy.
+- Tests: `tests/test_org.py` covers the TOML parse, byte-for-byte handbook survival including
+  hard escapes, plan-only, idempotent re-run, symlinked `.codex`, `.codex/agents` and target
+  file, user-scope same-name by file and by `name` field, atomic batch refusal, unsafe and
+  infrastructure names, adopted files, and shipped-agent regeneration.
+
 ## 0.1.13 (2026-11-13)
 
 - **Fixed the false-pass paths measured by the independent review.** `wait_agent` and

@@ -29,3 +29,13 @@ runs, with a "Model metadata not found, defaulting to fallback metadata" warning
 `~/.codex/openrouter-model-catalog.json` is where an entry is added. Effort is the lane's
 value, because the lane is what the tracker sanctions; a handbook that stated an effort keeps
 it, and only the remaining agents take the lane's default rung.
+
+## A project's own employees
+
+These files are the package's staff. A project's employees are registered separately, by
+`cwf/bin/cwf-org register HANDBOOK.md ... --execute`, into `<project>/.codex/agents/<name>.toml`.
+Both use the same writer, `cwf/lib/cwf_agents.py`, which parses every render back before it is
+accepted. `cwf-org` refuses any name that a user-scope agent (`~/.codex/agents`) already
+has. User scope wins on Codex, so a same-named project agent would never load, and the
+user's file is reported, never overwritten. It also refuses the names shipped here, and it
+never writes through a symlink.

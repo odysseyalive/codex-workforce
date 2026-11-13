@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""cwf-org — generate and register a project's employees as Codex custom agents.
+
+    cwf-org register [--project DIR] [--execute] HANDBOOK.md ...
+    cwf-org check    [--project DIR]
+
+The Codex counterpart of the registration half of upstream's `org` procedure
+(claude-workforce `workforce/references/procedures/org.md`). Upstream's employee IS its
+handbook, `.claude/agents/<name>.md`; Codex discovers a project agent only as
+`<project>/.codex/agents/<name>.toml`, so a handbook becomes a registration by rendering it to
+TOML. Chart generation (`org index`) is not here yet; it is tracker item C1.2.
+
+`register` renders each handbook (markdown with `name`/`description` frontmatter, the shape of
+upstream's AGENT.md) to TOML: the body goes into `developer_instructions` byte for byte, after a
+host-limits paragraph, and the render is parsed back before it is accepted. It PLANS by
+default; `--execute` writes. A batch is ATOMIC OR ABSENT: if any handbook is refused, nothing
+is written, because a half-registered org is the state upstream refuses to leave behind.
+
+A handbook is refused, never written, when:
+  - its name is unsafe as a file name, or names infrastructure (`cwf-workforce`, `cwf-org`,
+    `cwf-dev`; never employees) or an agent this package ships;
+  - a user-scope agent has the same name. User scope WINS on Codex (measured 8/8 on
+    codex-cli 0.168.0, AGENTS.md § Scope and precedence), so a project copy would never load,
+    and the user's file is never touched;
+  - `.codex/agents/<name>.toml` exists and this tool did not generate it (an adopted agent is
+    charted, never rewritten: org.md § Mode index, step 1a);
+  - another project `.codex/agents/*.toml` already holds the name, by `name` field or stem;
+  - any component of `.codex/agents/<name>.toml` is a symlink, or `<project>/.codex` is the
+    user-scope Codex home (`$CODEX_HOME` or `~/.codex`, compared by realpath, so the guard holds
+    before `agents/` exists), or `.codex/agents` resolves to the user-scope agents directory.
+
+A handbook's frontmatter takes one-line `key: value` pairs only; a block (`>`, `|`) or
+indented value, broken quoting, or a duplicate key is refused rather than guessed at.
+
+`check` reads every `.codex/agents/*.toml`: a symlinked `.codex` or `.codex/agents`, a project
+`.codex` that is the user home, unparseable or undecodable files (QUARANTINED), two project
+agents with one name (DUPLICATE), user-scope shadowing, and which files this tool generated.
+Exit 1 when something needs attention.
+
+Host limits, stated rather than implied: the handbook's `tools:` and `disallowedTools:` survive
+only as instruction text (prose-only; Codex has no per-agent allowlist). Whether a TOML written
+mid-session is spawnable in that same session is UNVERIFIED. Codex's workspace-write sandbox
+may refuse writes under `.codex/`; the write then fails with the OS error and nothing is
+half-written.
+
+Exit: 0 ok / 1 refused or needs attention / 2 usage or unreadable input.
+"""
+import argparse
+import os
+import re
+import sys
+import tempfile
+import tomllib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PKG = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(PKG, "cwf", "lib"))
+
+import cwf_agents  # noqa: E402
+
+MARKER = "# cwf-org: generated"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+INFRASTRUCTURE = ("cwf-workforce", "cwf-org", "cwf-dev")
+
+
+def say(msg):
+    print(f"cwf-org: {msg}")
+
+
+def project_root(path):
+    from subprocess import run, DEVNULL
+    try:
+        out = run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True,
+                  text=True, timeout=5, stdin=DEVNULL)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except OSError:
+        pass
+    return os.path.abspath(path)
+
+
+def user_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def user_agents_dir():
+    return os.path.join(user_home(), "agents")
+
+
+def user_home_conflict(root):
+    """Why `<root>/.codex` is the user-scope Codex home (or its agents directory is the
+    user-scope one), or None. Compared by realpath, so it holds before `agents/` exists."""
+    mine, home = os.path.join(root, ".codex"), user_home()
+    if os.path.realpath(mine) == os.path.realpath(home):
+        return f"{mine} is the user-scope Codex home ({home}); refusing to treat it as a project"
+    if os.path.realpath(os.path.join(mine, "agents")) == os.path.realpath(user_agents_dir()):
+        return f"{mine}/agents is the user-scope agents directory; refusing to write there"
+    return None
+
+
+def read_agents(directory):
+    """[(file, path, name, error)] for every TOML in `directory`. `name` is the `name`
+    field, or the file stem when the file has none; `error` is why it could not be read."""
+    try:
+        entries = sorted(f for f in os.listdir(directory) if f.endswith(".toml"))
+    except OSError:
+        return []
+    out = []
+    for fn in entries:
+        path = os.path.join(directory, fn)
+        try:
+            with open(path, "rb") as fh:
+                data = tomllib.load(fh)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            out.append((fn, path, fn[:-5], f"{type(exc).__name__}: {exc}"))
+            continue
+        name = data.get("name")
+        out.append((fn, path, name if isinstance(name, str) else fn[:-5], None))
+    return out
+
+
+def agent_names(directory):
+    """{name: path} for every TOML in `directory`, keyed by both its `name` field and its
+    file stem, because either is how a session could resolve it."""
+    names = {}
+    for fn, path, name, _ in read_agents(directory):
+        names.setdefault(fn[:-5], path)
+        names.setdefault(name, path)
+    return names
+
+
+def shipped_names():
+    return set(agent_names(os.path.join(PKG, "cwf", "agents")))
+
+
+def links_in(root, parts):
+    """The first symlink at or below `root` along `parts`, or None."""
+    p = root
+    for part in parts:
+        p = os.path.join(p, part)
+        if os.path.islink(p):
+            return p
+    return None
+
+
+def generated_by_us(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.readline().startswith(MARKER)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def render(handbook, root):
+    """(name, toml_text) for one handbook, or raise AgentError."""
+    with open(handbook, encoding="utf-8") as fh:
+        text = fh.read()
+    fields, body = cwf_agents.parse_frontmatter(text)
+    name = fields.get("name") or os.path.splitext(os.path.basename(handbook))[0]
+    if not NAME_RE.match(name):
+        raise cwf_agents.AgentError(f"name {name!r} is not a safe agent file name "
+                                    "(lowercase letters, digits, - and _)")
+    desc = fields.get("description", "")
+    if not desc:
+        raise cwf_agents.AgentError(f"{name}: frontmatter has no description")
+    rel = os.path.relpath(os.path.abspath(handbook), root)
+    source = os.path.abspath(handbook) if rel.startswith("..") else rel
+    if any(ord(c) < 32 or ord(c) == 127 for c in source):
+        raise cwf_agents.AgentError(f"{name}: handbook path holds a control character")
+    instructions = (cwf_agents.host_limits(fields.get("tools"), fields.get("disallowedTools"),
+                                           origin="handbook")
+                    + "\n\n" + body.strip("\n"))
+    header = (f"cwf-org: generated from {source}. Edit the handbook and re-run",
+              "`cwf-org register`; a hand edit here is overwritten.")
+    toml = cwf_agents.render_agent_toml(
+        name, desc, instructions, model=fields.get("model") or None,
+        effort=fields.get("model_reasoning_effort") or fields.get("effort") or None,
+        header=header)
+    return name, toml
+
+
+def plan(handbooks, root):
+    """One row per handbook: (status, name, detail, toml). Status is NEW, UPDATE,
+    UNCHANGED, or REFUSED."""
+    agents_dir = os.path.join(root, ".codex", "agents")
+    user = agent_names(user_agents_dir())
+    shipped = shipped_names()
+    home_conflict = user_home_conflict(root)
+    project = read_agents(agents_dir)
+    rows, seen = [], set()
+    for hb in handbooks:
+        try:
+            name, toml = render(hb, root)
+        except (OSError, UnicodeDecodeError, cwf_agents.AgentError) as exc:
+            rows.append(("REFUSED", os.path.basename(hb), str(exc), None))
+            continue
+        dest = os.path.join(agents_dir, name + ".toml")
+        link = links_in(root, (".codex", "agents", name + ".toml"))
+        held = [p for fn, p, n, _ in project if p != dest and name in (n, fn[:-5])]
+        if name in seen:
+            why = "named twice in this batch"
+        elif name in INFRASTRUCTURE:
+            why = "infrastructure, never an employee (self-exclusion)"
+        elif home_conflict:
+            why = home_conflict
+        elif name in user:
+            why = (f"SHADOWED: user-scope {user[name]} has this name and wins on Codex, "
+                   "so a project copy would never load; the user file is left alone")
+        elif name in shipped:
+            why = "the name of an agent this package ships; pick another name"
+        elif link:
+            why = f"refusing to write through symlink {link}"
+        elif held:
+            why = (f"DUPLICATE: project agent {held[0]} already has this name; two project "
+                   "agents with one name is ambiguous")
+        elif os.path.lexists(dest) and not generated_by_us(dest):
+            why = f"{dest} exists and was not generated by cwf-org; left alone (adopted)"
+        else:
+            why = None
+        seen.add(name)
+        if why:
+            rows.append(("REFUSED", name, why, None))
+        elif not os.path.lexists(dest):
+            rows.append(("NEW", name, dest, toml))
+        else:
+            try:
+                with open(dest, encoding="utf-8") as fh:
+                    same = fh.read() == toml
+            except UnicodeDecodeError:   # our marker, damaged since: regenerate it
+                same = False
+            rows.append(("UNCHANGED" if same else "UPDATE", name, dest, toml))
+    return rows
+
+
+def write(root, name, toml):
+    """Write one registration without following a link, then read it back."""
+    agents_dir = os.path.join(root, ".codex", "agents")
+    os.makedirs(agents_dir, exist_ok=True)
+    link = links_in(root, (".codex", "agents", name + ".toml"))
+    if link:   # nothing raced a link in during creation
+        raise cwf_agents.AgentError(f"refusing to write through symlink {link}")
+    dest = os.path.join(agents_dir, name + ".toml")
+    fd, tmp = tempfile.mkstemp(dir=agents_dir, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(toml)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+    with open(dest, encoding="utf-8") as fh:
+        back = fh.read()
+    if back != toml:
+        raise cwf_agents.AgentError(f"{dest}: read-back differs from what was written")
+    tomllib.loads(back)
+    return dest
+
+
+def cmd_register(args):
+    root = project_root(args.project)
+    rows = plan(args.handbooks, root)
+    for status, name, detail, _ in rows:
+        say(f"{status:9} {name}: {detail}")
+    refused = [r for r in rows if r[0] == "REFUSED"]
+    if refused:
+        say(f"{len(refused)} refused; nothing written (a batch is atomic or absent)")
+        return 1
+    todo = [r for r in rows if r[0] in ("NEW", "UPDATE")]
+    if not args.execute:
+        say(f"plan only: {len(todo)} to write. Re-run with --execute.")
+        return 0
+    for _, name, _, toml in todo:
+        say(f"wrote {write(root, name, toml)} (parsed back)")
+    if todo:
+        say("UNVERIFIED whether a session started before this write can spawn the new agent; "
+            "a new session loads it.")
+    return 0
+
+
+def cmd_check(args):
+    root = project_root(args.project)
+    agents_dir = os.path.join(root, ".codex", "agents")
+    conflict = user_home_conflict(root)
+    link = links_in(root, (".codex", "agents"))
+    if conflict or link:
+        say(f"SYMLINK     {link} -> {os.path.realpath(link)}" if link else f"REFUSED     {conflict}")
+        return 1
+    if not os.path.isdir(agents_dir):
+        say(f"no project agents at {agents_dir}")
+        return 0
+    user = agent_names(user_agents_dir())
+    entries = read_agents(agents_dir)
+    holders = {}
+    for fn, _, name, err in entries:
+        if not err:
+            holders.setdefault(name, []).append(fn)
+    bad = 0
+    for fn, path, name, err in entries:
+        kind = "generated" if generated_by_us(path) else "adopted"
+        others = [f for f in holders.get(name, []) if f != fn]
+        hit = user.get(name) or user.get(fn[:-5])
+        if os.path.islink(path):
+            say(f"SYMLINK     {fn}: {os.path.realpath(path)}")
+        elif err:
+            say(f"QUARANTINED {fn}: {err}")
+        elif others:
+            say(f"DUPLICATE   {fn} ({kind}): name {name!r} is also held by {', '.join(others)}")
+        elif hit:
+            say(f"SHADOWED    {fn} ({kind}): user-scope {hit} wins; this copy never loads")
+        else:
+            say(f"OK          {fn} ({kind})")
+            continue
+        bad += 1
+    return 1 if bad else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Register a project's employees as Codex agents.")
+    sub = ap.add_subparsers(dest="command", required=True)
+    reg = sub.add_parser("register", help="render handbooks to .codex/agents/<name>.toml")
+    reg.add_argument("handbooks", nargs="+", metavar="HANDBOOK.md")
+    reg.add_argument("--project", default=".", help="project directory (default: the git root of .)")
+    reg.add_argument("--execute", action="store_true", help="write; without it this only plans")
+    chk = sub.add_parser("check", help="parse every project agent and report shadowing")
+    chk.add_argument("--project", default=".")
+    args = ap.parse_args()
+    if not os.path.isdir(args.project):
+        say(f"no such project directory: {args.project}")
+        return 2
+    return cmd_register(args) if args.command == "register" else cmd_check(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

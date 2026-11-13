@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The TOML writer shared with cwf/bin/cwf-org, so both escape and verify the same way.
+sys.path.insert(0, os.path.join(ROOT, "cwf", "lib"))
+import cwf_agents  # noqa: E402
 UP = os.path.join(ROOT, "upstream", "claude-workforce", "workforce", "skills")
 # Shipped skills are generated into a VISIBLE tree, like upstream's workforce/skills/.
 # A dot-directory is an install target only: nothing this package ships is committed under
@@ -216,10 +219,10 @@ BIN_REPLACEMENTS = {
 
 
 def frontmatter_split(text):
-    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
-    if not m:
-        raise SystemExit("no frontmatter")
-    return m.group(1), text[m.end():]
+    try:
+        return cwf_agents.split_frontmatter(text)
+    except cwf_agents.AgentError as exc:
+        raise SystemExit(str(exc))
 
 
 def rewrite(name, rel, text):
@@ -244,16 +247,6 @@ def rewrite(name, rel, text):
                 f"skills/{name}. Edit the generator, not this file. -->\n")
         text = "---\n" + "\n".join(lines) + "\n---\n" + note + body
     return text
-
-
-def parse_frontmatter(text):
-    head, body = frontmatter_split(text)
-    fields = {}
-    for line in head.splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            fields[k.strip()] = v.strip().strip('"').strip("'")
-    return fields, body
 
 
 def rewrite_agent_text(text):
@@ -283,7 +276,10 @@ def build_agent(src, slug, out_path):
     host-limits paragraph beside it; the Claude tool keys are not represented as
     enforcement, because Codex has none."""
     text = rewrite_agent_text(open(src, encoding="utf-8").read())
-    fields, body = parse_frontmatter(text)
+    try:
+        fields, body = cwf_agents.parse_frontmatter(text)
+    except cwf_agents.AgentError as exc:
+        raise SystemExit(f"{slug}: {exc}")
     name = fields.get("name") or slug.replace("-", "_")
     desc = fields.get("description") or ""
     lane = AGENT_LANES.get(slug)
@@ -294,26 +290,20 @@ def build_agent(src, slug, out_path):
     # The upstream agent names carry the wf- namespace; Codex's built-ins and the
     # generated skill rows use cwf-. Keep the name stable and collision-free.
     codex_name = "cwf-" + name[len("wf-"):] if name.startswith("wf-") else name
-    out = [
-        f'name = {json.dumps(codex_name)}',
-        f'description = {json.dumps(desc)}',
-    ]
-    out.append(f'model = {json.dumps(seat["model"])}')
-    if effort:
-        out.append(f'model_reasoning_effort = "{effort}"')
-    notes = ("Host limits: Codex custom agents cannot enforce a per-agent tool allowlist or "
-             "`disallowedTools:`. The upstream definition named "
-             f"`{fields.get('tools', '(none)')}` and `{fields.get('disallowedTools', '(none)')}`; "
-             "treat those as instructions and detection, never as host enforcement.")
+    notes = cwf_agents.host_limits(fields.get("tools"), fields.get("disallowedTools"))
     pin = (f"Model lane: `{lane}` -> `{seat['model']}` at `{effort}` effort, chosen 2026-11-12 "
            "from the model-lane research in `.codex-workforce/plans/codex-conversion-completion.md` "
            "§ Stage 6. A custom agent cannot set `model_provider`, so this ID resolves only when "
            "the parent session routes to OpenRouter; if the catalog lacks it, Codex falls back to "
            "default metadata and says so on stderr.")
-    out.append('developer_instructions = """\n' + notes + "\n" + pin + "\n\n" + body.strip() + '\n"""')
+    try:
+        toml = cwf_agents.render_agent_toml(codex_name, desc, notes + "\n" + pin + "\n\n" + body.strip(),
+                                            model=seat["model"], effort=effort or None)
+    except cwf_agents.AgentError as exc:
+        raise SystemExit(f"{slug}: {exc}")
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out) + "\n")
+    path.write_text(toml)
     return path
 
 
@@ -347,6 +337,9 @@ def build_bin(name):
     text = open(src, encoding="utf-8").read()
     for old, new in BIN_REPLACEMENTS.get(name, []):
         text = text.replace(old, new)
+    # Upstream wf-settings-apply has one whitespace-only docstring line; the shipped copy
+    # must pass `git diff --check`, and the build must reproduce the committed file.
+    text = re.sub(r"[ \t]+$", "", text, flags=re.M)
     path = Path(BIN_OUT, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)

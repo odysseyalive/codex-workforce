@@ -27,6 +27,7 @@ cwf/bin/cwf-hook
 cwf/bin/cwf-step
 cwf/bin/cwf-model-catalog
 cwf/bin/cwf-sync
+cwf/bin/cwf-org
 cwf/model-catalog.json
 cwf/bin/wf-code-eval
 cwf/bin/wf-map
@@ -34,6 +35,7 @@ cwf/bin/wf-census
 cwf/bin/wf-settings-apply
 cwf/lib/cwf_codex.py
 cwf/lib/cwf_juror.py
+cwf/lib/cwf_agents.py
 upstream/claude-workforce/UPSTREAM.md
 upstream/claude-workforce/workforce/bin/wf-settings-apply
 upstream/claude-workforce/workforce/bin/wf-task-tag
