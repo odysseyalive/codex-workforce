@@ -3,6 +3,28 @@
 The version lives in `VERSION`. Bump it in the same change that alters anything listed in
 `manifest.txt`, and add an entry here.
 
+## 0.1.15 (2026-11-13)
+
+- **`cwf/bin/cwf-org index`: the org chart** (tracker `C1.2`). It rebuilds
+  `.codex-workforce/org-chart.md` from `.codex/agents/*.toml`, and `register --execute` runs it
+  after writing, so the chart follows the registrations. The chart carries the `AUTO-GENERATED`
+  marker the prompt hook reads (`cwf_codex.dispatch_context` then gives the org dispatch line,
+  and `index` checks that it does after the write), a `workforce-version:` stamp read from
+  `VERSION`, the prose-only honesty line, the chain of command, a roster, and each employee's
+  scope (its `description`). The chain is built only from each agent's ORG-RECORD `reports-to`.
+  An agent with no ORG-RECORD is an adopted roster row and is not drawn into the chain. A
+  `reports-to` naming nobody, or a loop, is drawn under `ceo` and flagged. Unparseable,
+  duplicate, shadowed and symlinked agents get loud rows. Shipped and infrastructure agents are
+  left off. A rerun with nothing changed writes nothing (`UNCHANGED`). `index` refuses a chart
+  without the marker (hand-written) and any symlink on the chart path. The writer is
+  `register`'s temp-file, rename and read-back path, now shared. Not part of this release:
+  mechanicals, the `## Skills` block, contract stamps, `org embed`, `org status`.
+- Tests: `tests/test_org.py` adds nine chart cases: marker, roster, scopes and chain from a
+  real registration, the prompt hook reading the chart as an org, a reports-to loop drawn once
+  and flagged, a byte-identical rerun, zero
+  employees, shipped agents excluded, quarantined and shadowed rows, a hand-written chart left
+  alone, and a symlinked chart refused.
+
 ## 0.1.14 (2026-11-13)
 
 - **`cwf/bin/cwf-org register`: a project's employees become Codex custom agents** (tracker

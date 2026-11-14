@@ -2,13 +2,14 @@
 """cwf-org — generate and register a project's employees as Codex custom agents.
 
     cwf-org register [--project DIR] [--execute] HANDBOOK.md ...
+    cwf-org index    [--project DIR]
     cwf-org check    [--project DIR]
 
 The Codex counterpart of the registration half of upstream's `org` procedure
 (claude-workforce `workforce/references/procedures/org.md`). Upstream's employee IS its
 handbook, `.claude/agents/<name>.md`; Codex discovers a project agent only as
 `<project>/.codex/agents/<name>.toml`, so a handbook becomes a registration by rendering it to
-TOML. Chart generation (`org index`) is not here yet; it is tracker item C1.2.
+TOML. `index` then rebuilds the org chart from those registrations (tracker item C1.2).
 
 `register` renders each handbook (markdown with `name`/`description` frontmatter, the shape of
 upstream's AGENT.md) to TOML: the body goes into `developer_instructions` byte for byte, after a
@@ -32,6 +33,20 @@ A handbook is refused, never written, when:
 A handbook's frontmatter takes one-line `key: value` pairs only; a block (`>`, `|`) or
 indented value, broken quoting, or a duplicate key is refused rather than guessed at.
 
+`index` writes `.codex-workforce/org-chart.md`, a derived cache of `.codex/agents/*.toml` (the
+files win when they disagree; upstream `references/org-chart-format.md`). It carries the
+`AUTO-GENERATED` marker the prompt hook looks for, a roster, each employee's scope (its
+`description`, which is what dispatch matches on), and the chain of command. The chain is built
+only from the `reports-to` in each agent's ORG-RECORD block, the HTML comment upstream puts right
+after a handbook's frontmatter, which `register` carries into `developer_instructions`
+unchanged. An agent with no ORG-RECORD is ADOPTED: a roster row with `—` for tier, department
+and manager, never drawn into the chain. A `reports-to` naming nobody (ORPHAN) or sitting on
+a loop (CYCLE) is drawn under `ceo` and flagged, never reparented in the file. Unreadable, shadowed, duplicate and symlinked agents get loud
+roster rows, never a silent absence. Shipped and infrastructure names are not employees and are
+left out. `index` refuses a chart without the marker (hand-written) and any symlink on the chart
+path. `register --execute` runs `index` after it writes, so the chart follows the registrations.
+Not here yet: mechanicals, the `## Skills` block, contract stamps, `org embed` and `org status`.
+
 `check` reads every `.codex/agents/*.toml`: a symlinked `.codex` or `.codex/agents`, a project
 `.codex` that is the user home, unparseable or undecodable files (QUARANTINED), two project
 agents with one name (DUPLICATE), user-scope shadowing, and which files this tool generated.
@@ -46,6 +61,7 @@ half-written.
 Exit: 0 ok / 1 refused or needs attention / 2 usage or unreadable input.
 """
 import argparse
+import datetime
 import os
 import re
 import sys
@@ -57,6 +73,7 @@ PKG = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(PKG, "cwf", "lib"))
 
 import cwf_agents  # noqa: E402
+import cwf_codex  # noqa: E402
 
 MARKER = "# cwf-org: generated"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -232,18 +249,19 @@ def plan(handbooks, root):
     return rows
 
 
-def write(root, name, toml):
-    """Write one registration without following a link, then read it back."""
-    agents_dir = os.path.join(root, ".codex", "agents")
-    os.makedirs(agents_dir, exist_ok=True)
-    link = links_in(root, (".codex", "agents", name + ".toml"))
+def write_file(root, parts, text):
+    """Write `<root>/<parts...>` without following a link, through a temp file and a rename,
+    then read it back. Returns the path."""
+    directory = os.path.join(root, *parts[:-1])
+    os.makedirs(directory, exist_ok=True)
+    link = links_in(root, parts)
     if link:   # nothing raced a link in during creation
         raise cwf_agents.AgentError(f"refusing to write through symlink {link}")
-    dest = os.path.join(agents_dir, name + ".toml")
-    fd, tmp = tempfile.mkstemp(dir=agents_dir, prefix=f".{name}.", suffix=".tmp")
+    dest = os.path.join(root, *parts)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{parts[-1]}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(toml)
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, 0o644)
@@ -254,10 +272,244 @@ def write(root, name, toml):
         raise
     with open(dest, encoding="utf-8") as fh:
         back = fh.read()
-    if back != toml:
+    if back != text:
         raise cwf_agents.AgentError(f"{dest}: read-back differs from what was written")
-    tomllib.loads(back)
     return dest
+
+
+def write(root, name, toml):
+    """Write one registration, then prove it parses back."""
+    dest = write_file(root, (".codex", "agents", name + ".toml"), toml)
+    with open(dest, "rb") as fh:
+        tomllib.load(fh)
+    return dest
+
+
+# ── the org chart (C1.2) ────────────────────────────────────────────────
+CHART_PARTS = tuple(cwf_codex.ORG_CHART_REL.split(os.sep))
+CHART_MARKER = "<!-- AUTO-GENERATED by cwf-org index. Do not hand-edit. -->"
+assert cwf_codex.ORG_MARKER.decode() in CHART_MARKER   # the prompt hook must recognise it
+HONESTY = ("Chain of command is prose only on Codex: a custom agent cannot be restricted from "
+           "spawning another, and there is no deny layer. Treat the org chart as a contract, "
+           "not a sandbox.")
+RECORD_START, RECORD_END = "<!-- ORG-RECORD START", "<!-- ORG-RECORD END -->"
+DASH = "—"
+
+
+def org_record(text):
+    """(fields, error) from the ORG-RECORD block in a handbook body. (None, None) when there is
+    none; one marker without its pair is an error, reported and never repaired."""
+    start, end = text.find(RECORD_START), text.find(RECORD_END)
+    if start < 0 and end < 0:
+        return None, None
+    if start < 0 or end < start:
+        return None, "ORG-RECORD has one marker without its pair"
+    fields = {}
+    for line in text[start:end].splitlines()[1:]:
+        line = line.strip()
+        if not (line.startswith("<!--") and line.endswith("-->")):
+            continue
+        for pair in line[4:-3].split("|"):
+            key, sep, value = pair.partition(":")
+            if sep:
+                value = value.strip()
+                fields[key.strip()] = "" if value == "(none)" else value
+    return fields, None
+
+
+def version():
+    try:
+        with open(os.path.join(PKG, "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def cell(value):
+    """One markdown table cell: one line, pipes escaped, `—` when empty."""
+    value = " ".join(str(value or "").split())
+    return value.replace("|", "\\|") if value else DASH
+
+
+def employees(root):
+    """One dict per project agent that is an employee: the shipped agents and the
+    infrastructure names are this package, not the project's org."""
+    agents_dir = os.path.join(root, ".codex", "agents")
+    user = agent_names(user_agents_dir())
+    skip = shipped_names() | set(INFRASTRUCTURE)
+    entries = read_agents(agents_dir)
+    holders = {}
+    for fn, _, name, err in entries:
+        if not err:
+            holders.setdefault(name, []).append(fn)
+    rows = []
+    for fn, path, name, err in entries:
+        if name in skip or fn[:-5] in skip:
+            continue
+        row = {"name": name, "file": fn, "scope": "", "model": "", "effort": "", "record": None,
+               "flag": None}
+        others = [f for f in holders.get(name, []) if f != fn]
+        hit = user.get(name) or user.get(fn[:-5])
+        if os.path.islink(path):
+            row["flag"] = f"SYMLINK: {os.path.realpath(path)}"
+        elif err:
+            row["flag"] = f"QUARANTINED: {err}"
+        else:
+            with open(path, "rb") as fh:
+                data = tomllib.load(fh)
+            row["scope"] = data.get("description") if isinstance(data.get("description"), str) else ""
+            row["model"] = data.get("model") or ""
+            row["effort"] = data.get("model_reasoning_effort") or ""
+            instr = data.get("developer_instructions")
+            record, bad = org_record(instr if isinstance(instr, str) else "")
+            row["record"] = record
+            if bad:
+                row["flag"] = f"QUARANTINED: {bad}"
+            elif others:
+                row["flag"] = f"DUPLICATE: name also held by {', '.join(others)}"
+            elif hit:
+                row["flag"] = f"SHADOWED: user-scope {hit} wins; this copy never loads"
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["name"], r["file"]))
+
+
+def tier_of(row):
+    m = re.match(r"\s*T?(\d+)", (row["record"] or {}).get("tier", ""))
+    return f"T{m.group(1)}" if m else "T?"
+
+
+def chain_lines(governed):
+    """The Chain of Command tree, built from the union of `reports-to` and nothing else."""
+    by_name = {r["name"]: r for r in governed}
+    kids, flagged = {}, []
+    for r in governed:
+        boss = r["record"].get("reports-to", "")
+        if boss == "ceo" or boss in by_name and boss != r["name"]:
+            kids.setdefault(boss, []).append(r["name"])
+        else:
+            flagged.append((r["name"], f"ORPHAN: reports-to `{boss or '(none)'}` names no governed "
+                                       "employee; provisionally under ceo (flagged)"))
+    lines, seen = ["- ceo (T1, the main session)"], set()
+
+    def draw(name, depth, note=""):
+        seen.add(name)
+        lines.append("  " * depth + f"- {name} ({tier_of(by_name[name])})" + note)
+        for kid in sorted(kids.get(name, [])):
+            if kid not in seen:
+                draw(kid, depth + 1)
+
+    for name in sorted(kids.get("ceo", [])):
+        draw(name, 1)
+    for name, note in flagged:
+        draw(name, 1, f" — {note}")
+    marks = {n: "ORPHAN" for n, _ in flagged}
+    left = set(by_name) - seen   # each sits on, or hangs below, a reports-to loop
+
+    def on_loop(name):
+        step, walked = by_name[name]["record"]["reports-to"], set()
+        while step in by_name and step not in walked:
+            if step == name:
+                return True
+            walked.add(step)
+            step = by_name[step]["record"]["reports-to"]
+        return False
+
+    marks.update({n: "CYCLE" for n in left if on_loop(n)})
+    for name in sorted(n for n in left if marks.get(n) == "CYCLE"):
+        if name not in seen:
+            draw(name, 1, " — CYCLE: its reports-to chain never reaches ceo; provisionally "
+                          "under ceo (flagged)")
+    if not governed:
+        lines.append("- (no governed employees: an agent joins the chain when its handbook "
+                     "carries an ORG-RECORD with `reports-to`)")
+    return lines, marks
+
+
+def render_chart(rows, today):
+    governed = [r for r in rows if not r["flag"] and r["record"] is not None]
+    depts = {r["record"].get("department") for r in governed} - {"", None}
+    chain, orphans = chain_lines(governed)
+    out = ["# Org Chart", "", CHART_MARKER,
+           f"<!-- Generated: {today} | harness: codex | workforce-version: {version()} -->",
+           f"<!-- headcount: {len(rows)} | departments: {len(depts)} -->", "", HONESTY, "",
+           "The files are the source of truth: this chart is rebuilt from `.codex/agents/*.toml` "
+           "by `cwf-org index`, and the file on disk wins when the two disagree.", "",
+           "## Chain of Command", *chain, "", "## Roster"]
+    if not rows:
+        out.append("No employees yet: `.codex/agents/` holds no project agent. "
+                   "`cwf-org register` adds one.")
+    else:
+        out += ["| Employee | Tier | Dept | Reports to | Model / Effort | Triggers | Status |",
+                "|---|---|---|---|---|---|---|"]
+        for r in rows:
+            rec = r["record"] or {}
+            if r["flag"]:
+                status = r["flag"]
+            elif r["record"] is None:
+                status = "adopted"
+            else:
+                status = f"{orphans[r['name']]} (flagged)" if r["name"] in orphans else "governed"
+            out.append("| " + " | ".join(cell(v) for v in (
+                r["name"], tier_of(r) if r["record"] is not None else "",
+                rec.get("department"), rec.get("reports-to"),
+                f"{r['model'] or DASH} / {r['effort'] or DASH}", rec.get("triggers"),
+                status)) + " |")
+    out += ["", "## Scopes"]
+    if not rows:
+        out.append("No employees yet.")
+    for r in rows:
+        out.append(f"- `{r['name']}` ({r['file']}): {' '.join(r['scope'].split()) or DASH}")
+    return "\n".join(out) + "\n", orphans
+
+
+def without_date(text):
+    return re.sub(r"<!-- Generated: [^|]*\|", "<!-- Generated: |", text, count=1)
+
+
+def cmd_index(args):
+    root = project_root(args.project)
+    conflict = user_home_conflict(root)
+    link = links_in(root, (".codex", "agents")) or links_in(root, CHART_PARTS)
+    if conflict or link:
+        say(f"REFUSED   {conflict or f'refusing to read or write through symlink {link}'}")
+        return 1
+    dest = os.path.join(root, *CHART_PARTS)
+    prior = None
+    if os.path.lexists(dest):
+        try:
+            with open(dest, encoding="utf-8") as fh:
+                prior = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            say(f"REFUSED   {dest} is unreadable ({exc}); left alone")
+            return 1
+        if cwf_codex.ORG_MARKER.decode() not in prior[:1024]:
+            say(f"REFUSED   {dest} has no AUTO-GENERATED marker, so it is hand-written; "
+                "left alone")
+            return 1
+    rows = employees(root)
+    text, orphans = render_chart(rows, datetime.date.today().isoformat())
+    for r in rows:
+        if r["flag"]:
+            say(f"{r['flag'].split(':')[0]:9} {r['name']}: {r['flag']}")
+    for name, mark in sorted(orphans.items()):
+        say(f"{mark:9} {name}: its reports-to chain does not reach ceo; drawn under ceo")
+    if prior is not None and without_date(prior) == without_date(text):
+        say(f"UNCHANGED {dest}")
+        return 0
+    try:
+        write_file(root, CHART_PARTS, text)
+    except (OSError, cwf_agents.AgentError) as exc:
+        say(f"REFUSED   {dest}: {exc}")
+        return 1
+    if not cwf_codex.dispatch_context(root).startswith(cwf_codex.DISPATCH_ORG):
+        say(f"FAILED    {dest} was written but the prompt hook does not read it as an org")
+        return 1
+    adopted = sum(1 for r in rows if not r["flag"] and r["record"] is None)
+    flagged = sum(1 for r in rows if r["flag"])
+    say(f"{'UPDATED' if prior is not None else 'NEW':9} {dest}: {len(rows)} employee(s), "
+        f"{len(rows) - adopted - flagged} governed ({len(orphans)} flagged in the chain), {adopted} adopted, "
+        f"{flagged} flagged (read back)")
+    return 0
 
 
 def cmd_register(args):
@@ -278,6 +530,9 @@ def cmd_register(args):
     if todo:
         say("UNVERIFIED whether a session started before this write can spawn the new agent; "
             "a new session loads it.")
+    if cmd_index(args):
+        say("the registrations above were written; the org chart was not refreshed")
+        return 1
     return 0
 
 
@@ -325,13 +580,15 @@ def main():
     reg.add_argument("handbooks", nargs="+", metavar="HANDBOOK.md")
     reg.add_argument("--project", default=".", help="project directory (default: the git root of .)")
     reg.add_argument("--execute", action="store_true", help="write; without it this only plans")
+    idx = sub.add_parser("index", help="rebuild .codex-workforce/org-chart.md from .codex/agents")
+    idx.add_argument("--project", default=".")
     chk = sub.add_parser("check", help="parse every project agent and report shadowing")
     chk.add_argument("--project", default=".")
     args = ap.parse_args()
     if not os.path.isdir(args.project):
         say(f"no such project directory: {args.project}")
         return 2
-    return cmd_register(args) if args.command == "register" else cmd_check(args)
+    return {"register": cmd_register, "index": cmd_index, "check": cmd_check}[args.command](args)
 
 
 if __name__ == "__main__":

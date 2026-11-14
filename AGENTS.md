@@ -137,7 +137,8 @@ per-agent allowlist, so say so in the order rather than implying a restriction t
   renders each handbook to `<project>/.codex/agents/<name>.toml` through `cwf/lib/cwf_agents.py`
   (the same writer `scripts/build-skills` uses), and refuses symlinks, infrastructure names, and
   any name a user-scope agent already holds, since that copy would win. `check` reports shadowed
-  or unparseable project agents. Chart generation (`org index`) is not built yet.
+  or unparseable project agents. `index` writes `.codex-workforce/org-chart.md` (marker, roster,
+  scopes, chain of command from ORG-RECORD `reports-to`); `register --execute` runs it too.
 - `cwf/bin/cwf-sync`: mirrors this repo's tree into the user-root install after a change, the
   port of `bin/sync --personal`. Plans by default; `--execute` writes; `--check` exits 1 on
   drift. Never creates an install that was not already there, and **prunes only paths a
@@ -164,7 +165,7 @@ per-agent allowlist, so say so in the order rather than implying a restriction t
 - Commit only the package: `AGENTS.md`, `RESUME.md`, `.codex/hooks.json`, `cwf/`,
   `scripts/`, `tests/`, `upstream/`, `install`, `install.ps1`, `manifest.txt`, `VERSION`,
   `CHANGELOG.md`, `.gitignore` (and a README and LICENSE when they exist).
-- Versioning: `VERSION` holds the release (`0.1.14`). Any change to a file in `manifest.txt`
+- Versioning: `VERSION` holds the release (`0.1.15`). Any change to a file in `manifest.txt`
   bumps it and adds a `CHANGELOG.md` entry. Every new runtime file goes in `manifest.txt`;
   `tests/test_install.py` fails if one is missing.
   Files left by the tools used to build it (Claude Code, Crush discovery probes, opencode,
